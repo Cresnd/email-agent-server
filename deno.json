@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "lib": ["deno.window"],
+    "strict": true
+  },
+  "tasks": {
+    "dev": "deno run --allow-all --watch src/main.ts",
+    "start": "deno run --allow-all src/main.ts",
+    "test": "deno test --allow-all tests/",
+    "test:watch": "deno test --allow-all --watch tests/",
+    "build": "deno run --allow-all scripts/build.ts",
+    "deploy": "deno run --allow-all scripts/deploy.ts",
+    "migrate": "deno run --allow-all scripts/db-migrate.ts"
+  },
+  "imports": {
+    "@/": "./src/",
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.39.3",
+    "@oak/oak": "https://deno.land/x/oak@v12.6.1/mod.ts",
+    "@std/": "https://deno.land/std@0.210.0/"
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "build"
+  ]
+}
