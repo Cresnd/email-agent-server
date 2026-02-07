@@ -9,7 +9,7 @@ export interface DatabaseTool {
   tool_id: string;
   tool_name: string;
   tool_description: string;
-  tool_type: 'http_request' | 'postgres' | 'workflow' | 'memory' | 'ai_model';
+  tool_type: 'http_request' | 'postgres' | 'postgresTool' | 'workflow' | 'memory' | 'ai_model' | 'edge_function';
   method?: string;
   url?: string;
   authentication?: string;
@@ -79,33 +79,56 @@ export class ToolLoader {
   async executeTool(
     tool: DatabaseTool, 
     parameters: Record<string, any>, 
-    context: Record<string, any>
+    context: Record<string, any>,
+    workflowExecutionId?: string
   ): Promise<ToolExecutionResult> {
     const startTime = Date.now();
     
     try {
       this.logger.debug(`Executing tool: ${tool.tool_name}`, { tool_type: tool.tool_type });
 
+      let result: ToolExecutionResult;
       switch (tool.tool_type) {
         case 'http_request':
-          return await this.executeHttpTool(tool, parameters, context);
+          result = await this.executeHttpTool(tool, parameters, context);
+          break;
         case 'postgres':
-          return await this.executePostgresTool(tool, parameters, context);
+        case 'postgresTool':
+          result = await this.executePostgresTool(tool, parameters, context);
+          break;
+        case 'edge_function':
+          result = await this.executeEdgeFunctionTool(tool, parameters, context);
+          break;
         case 'workflow':
-          return await this.executeWorkflowTool(tool, parameters, context);
+          result = await this.executeWorkflowTool(tool, parameters, context);
+          break;
         default:
           throw new Error(`Tool type ${tool.tool_type} not supported yet`);
       }
+      
+      // Log tool execution with only used variables if workflowExecutionId provided
+      if (workflowExecutionId) {
+        await this.logToolExecution(workflowExecutionId, result, tool, { ...parameters, ...context });
+      }
+      
+      return result;
     } catch (error) {
       const executionTime = Date.now() - startTime;
       this.logger.error(`Tool execution failed: ${tool.tool_name}`, error);
       
-      return {
+      const result = {
         tool_name: tool.tool_name,
         success: false,
         error: (error as Error).message || 'Unknown error',
         execution_time_ms: executionTime
       };
+      
+      // Log failed tool execution
+      if (workflowExecutionId) {
+        await this.logToolExecution(workflowExecutionId, result, tool, { ...parameters, ...context });
+      }
+      
+      return result;
     }
   }
 
@@ -119,16 +142,38 @@ export class ToolLoader {
   ): Promise<ToolExecutionResult> {
     const startTime = Date.now();
 
-    // Replace template variables in URL and body
-    let url = this.replaceTemplateVars(tool.url!, { ...parameters, ...context });
-    let body = this.replaceTemplateVars(JSON.stringify(tool.tool_body || {}), { ...parameters, ...context });
+    // Add service role key to context for replacement
+    const enrichedContext = {
+      ...context,
+      ...parameters,
+      SUPABASE_SERVICE_ROLE_KEY: Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'),
+      database_project_ref: 'qaymciaujneyqhsbycmp' // Add the project ref
+    };
+
+    // Replace template variables in URL, headers, and body
+    let url = this.replaceTemplateVars(tool.url!, enrichedContext);
+    let body = this.replaceTemplateVars(JSON.stringify(tool.tool_body || {}), enrichedContext);
+    
+    // Process headers with template variables
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    
+    if (tool.tool_headers) {
+      for (const [key, value] of Object.entries(tool.tool_headers)) {
+        headers[key] = this.replaceTemplateVars(String(value), enrichedContext);
+      }
+    }
+
+    this.logger.debug(`Executing HTTP tool: ${tool.tool_name}`, {
+      url,
+      method: tool.method || 'POST',
+      headers: { ...headers, Authorization: headers.Authorization ? '[REDACTED]' : undefined }
+    });
 
     const response = await fetch(url, {
       method: tool.method || 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...tool.tool_headers
-      },
+      headers,
       body: body !== '{}' ? body : undefined
     });
 
@@ -156,6 +201,14 @@ export class ToolLoader {
 
     const query = this.replaceTemplateVars(tool.tool_body?.query || '', { ...parameters, ...context });
     
+    // Log the generated SQL for debugging
+    this.logger.debug(`Executing Postgres tool: ${tool.tool_name}`, {
+      original_query: tool.tool_body?.query,
+      generated_query: query,
+      parameters,
+      context_keys: Object.keys(context)
+    });
+    
     const { data, error } = await this.supabase.rpc('exec_sql', {
       sql_query: query
     });
@@ -167,6 +220,63 @@ export class ToolLoader {
       success: !error,
       result: data,
       error: error?.message,
+      execution_time_ms: executionTime
+    };
+  }
+
+  /**
+   * Execute Edge Function tool
+   */
+  private async executeEdgeFunctionTool(
+    tool: DatabaseTool, 
+    parameters: Record<string, any>, 
+    context: Record<string, any>
+  ): Promise<ToolExecutionResult> {
+    const startTime = Date.now();
+
+    // Add service role key to context for replacement
+    const enrichedContext = {
+      ...context,
+      ...parameters,
+      SUPABASE_SERVICE_ROLE_KEY: Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'),
+      database_project_ref: 'qaymciaujneyqhsbycmp'
+    };
+
+    // Replace template variables in URL and body
+    let url = this.replaceTemplateVars(tool.url!, enrichedContext);
+    let body = this.replaceTemplateVars(JSON.stringify(tool.tool_body || {}), enrichedContext);
+    
+    // Process headers with template variables
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}`
+    };
+    
+    if (tool.tool_headers) {
+      for (const [key, value] of Object.entries(tool.tool_headers)) {
+        headers[key] = this.replaceTemplateVars(String(value), enrichedContext);
+      }
+    }
+
+    this.logger.debug(`Executing Edge Function tool: ${tool.tool_name}`, {
+      url,
+      method: tool.method || 'POST'
+    });
+
+    const response = await fetch(url, {
+      method: tool.method || 'POST',
+      headers,
+      body: body !== '{}' ? body : undefined
+    });
+
+    const result = await response.json();
+    const executionTime = Date.now() - startTime;
+
+    return {
+      tool_name: tool.tool_name,
+      success: response.ok,
+      result: result,
+      error: !response.ok ? result.message || 'Edge function request failed' : undefined,
       execution_time_ms: executionTime
     };
   }
@@ -210,30 +320,79 @@ export class ToolLoader {
   }
 
   /**
-   * Log tool execution to database
+   * Extract variables used in a template string
+   */
+  private extractUsedVariables(template: string, context: Record<string, any>): Record<string, any> {
+    const usedVars: Record<string, any> = {};
+    const varPattern = /\{\{(\w+)\}\}/g;
+    let match;
+    
+    while ((match = varPattern.exec(template)) !== null) {
+      const varName = match[1];
+      if (context[varName] !== undefined) {
+        usedVars[varName] = context[varName];
+      }
+    }
+    
+    return usedVars;
+  }
+
+  /**
+   * Log tool execution to database with only used variables
    */
   async logToolExecution(
     workflowExecutionId: string,
-    toolResult: ToolExecutionResult
+    toolResult: ToolExecutionResult,
+    tool?: DatabaseTool,
+    context?: Record<string, any>
   ): Promise<void> {
     try {
+      // Extract only the variables that were actually used by this tool
+      let inputData: Record<string, any> = {};
+      
+      if (tool && context) {
+        if ((tool.tool_type === 'postgres' || tool.tool_type === 'postgresTool') && tool.tool_body?.query) {
+          inputData = this.extractUsedVariables(tool.tool_body.query, context);
+        } else if (tool.tool_type === 'http_request' || tool.tool_type === 'httpRequestTool') {
+          // Extract variables from URL and body
+          if (tool.url) {
+            Object.assign(inputData, this.extractUsedVariables(tool.url, context));
+          }
+          if (tool.tool_body) {
+            Object.assign(inputData, this.extractUsedVariables(JSON.stringify(tool.tool_body), context));
+          }
+        }
+      }
+
+      // Get the highest step_order to add the tool step after existing steps
+      const { data: maxOrderData } = await this.supabase
+        .from('workflow_execution_steps')
+        .select('step_order')
+        .eq('execution_id', workflowExecutionId)
+        .order('step_order', { ascending: false })
+        .limit(1)
+        .single();
+
+      const nextStepOrder = (maxOrderData?.step_order || 0) + 1;
+
+      // Insert a new tool workflow step for the executed tool
       await this.supabase
         .from('workflow_execution_steps')
         .insert({
           execution_id: workflowExecutionId,
-          step_id: `tool_${toolResult.tool_name}`,
-          step_name: toolResult.tool_name,
+          step_order: nextStepOrder,
           step_type: 'tool',
-          step_order: 100, // Tools are executed after agents
+          step_name: toolResult.tool_name,
+          node_id: tool?.tool_id || `tool_${toolResult.tool_name}`,
           status: toolResult.success ? 'completed' : 'failed',
+          input_data: inputData, // Only the variables this tool actually used
           output_data: {
             result: toolResult.result,
             error: toolResult.error
           },
           started_at: new Date(Date.now() - toolResult.execution_time_ms).toISOString(),
           completed_at: new Date().toISOString(),
-          output_processing_time_ms: toolResult.execution_time_ms,
-          node_id: `tool_${toolResult.tool_name}`
+          output_processing_time_ms: toolResult.execution_time_ms
         });
     } catch (error) {
       this.logger.warn('Failed to log tool execution', error);

@@ -64,6 +64,9 @@ export interface ActionExecutionAgentInput {
   original_email: EmailProcessingContext;
   customer_data: ParsingAgentOutput['customer'];
   
+  // Workflow execution tracking
+  workflowExecutionId?: string;
+  
   // Venue configuration
   venue_settings: VenueSettings;
   venue_prompts: {
@@ -133,6 +136,7 @@ export interface ActionExecutionAgentOutput {
 export class ActionExecutionAgent {
   private db: DatabaseQueries;
   private toolLoader: ToolLoader;
+  private currentWorkflowExecutionId?: string;
   private maxRetryAttempts = 3;
   private retryDelayMs = 1000; // Base delay for exponential backoff
 
@@ -148,6 +152,9 @@ export class ActionExecutionAgent {
   async process(input: ActionExecutionAgentInput): Promise<ActionExecutionAgentOutput> {
     const startTime = Date.now();
     const processingNotes: string[] = [];
+    
+    // Store workflowExecutionId for tool logging
+    this.currentWorkflowExecutionId = input.workflowExecutionId;
 
     try {
       // 1. Validate that we have the execution prompt
@@ -267,7 +274,7 @@ BUSINESS DECISION:
 EXTRACTED DATA:
 ${JSON.stringify(businessLogic.refined_extraction, null, 2)}
 
-CONTEXT: This email requires action type "${businessLogic.decision.action_type}". Generate an appropriate email response.
+CONTEXT: This email requires action type "${businessLogic.decision.action_type}". Generate an appropriate email response in JSON format.
     `.trim();
   }
 
@@ -287,6 +294,11 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
         throw new Error('OpenAI API key not found in environment variables');
       }
 
+      // Ensure the prompt contains "json" for OpenAI's json_object format requirement
+      const systemPrompt = executionPrompt.toLowerCase().includes('json') 
+        ? executionPrompt 
+        : executionPrompt + '\n\nYou must respond with valid JSON format.';
+
       // Make OpenAI API call
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -299,7 +311,7 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
           messages: [
             {
               role: 'system',
-              content: executionPrompt
+              content: systemPrompt
             },
             {
               role: 'user',
@@ -313,7 +325,13 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
       });
 
       if (!response.ok) {
-        throw new Error(`OpenAI API error: ${response.status} ${response.statusText}`);
+        const errorBody = await response.text();
+        console.error('OpenAI API Error Details:', {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorBody
+        });
+        throw new Error(`OpenAI API error: ${response.status} ${response.statusText} - ${errorBody}`);
       }
 
       const data = await response.json();
@@ -396,7 +414,7 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
       
       // Execute each tool
       for (const tool of toolsToExecute) {
-        const toolResult = await this.executeTool(tool, extractionData, venueSettings);
+        const toolResult = await this.executeTool(tool, extractionData, venueSettings, this.currentWorkflowExecutionId);
         
         toolExecutions.push({
           tool_name: toolResult.tool_name,
@@ -467,7 +485,8 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
   private async executeTool(
     tool: DatabaseTool, 
     extractionData: any, 
-    venueSettings: VenueSettings
+    venueSettings: VenueSettings,
+    workflowExecutionId?: string
   ): Promise<ToolExecutionResult> {
     
     // Prepare context for tool execution
@@ -477,7 +496,7 @@ CONTEXT: This email requires action type "${businessLogic.decision.action_type}"
       ...extractionData
     };
     
-    return await this.toolLoader.executeTool(tool, extractionData, context);
+    return await this.toolLoader.executeTool(tool, extractionData, context, workflowExecutionId);
   }
 
   /**

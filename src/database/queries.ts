@@ -596,7 +596,7 @@ export class DatabaseQueries {
       .from('venue_to_workflow')
       .select('workflow_id')
       .eq('venue_id', venueId)
-      .eq('type', 'send_email')
+      .eq('type', 'email_agent')
       .single();
     
     if (error) {
@@ -706,24 +706,42 @@ export class DatabaseQueries {
   }
 
   /**
-   * Create workflow execution steps with node mapping
+   * Get workflow tools for a template
+   */
+  async getWorkflowTools(templateId: string): Promise<any[]> {
+    const { data, error } = await this.supabase
+      .from('workflow_tools')
+      .select('*')
+      .eq('workflow_template_id', templateId)
+      .order('position_x');
+
+    if (error) {
+      throw new Error(`Failed to get workflow tools: ${error.message}`);
+    }
+
+    return data || [];
+  }
+
+  /**
+   * Create workflow execution steps with node mapping only
+   * Tools will be added dynamically when executed
    */
   async createWorkflowExecutionSteps(executionId: string, templateId: string): Promise<void> {
     const nodes = await this.getWorkflowNodes(templateId);
     
-    const stepInserts = nodes.map((node, index) => ({
+    // Create steps for nodes only - tools will be added when executed
+    const nodeSteps = nodes.map((node, index) => ({
       execution_id: executionId,
-      step_id: `step_${index + 1}`,
       step_order: index + 1,
       step_type: node.node_type,
       step_name: node.name,
-      node_id: node.node_id,
+      node_id: node.id,
       status: 'pending'
     }));
 
     const { error } = await this.supabase
       .from('workflow_execution_steps')
-      .insert(stepInserts);
+      .insert(nodeSteps);
 
     if (error) {
       throw new Error(`Failed to create workflow execution steps: ${error.message}`);
@@ -803,6 +821,50 @@ export class DatabaseQueries {
     }
 
     return data;
+  }
+
+  /**
+   * Get node ID for a workflow step by execution ID and step name
+   */
+  async getNodeIdByStepName(executionId: string, stepName: string): Promise<string | null> {
+    const { data, error } = await this.supabase
+      .from('workflow_execution_steps')
+      .select('node_id')
+      .eq('execution_id', executionId)
+      .eq('step_name', stepName)
+      .single();
+
+    if (error) {
+      this.logger.warn(`Could not find node ID for step: ${stepName}`, error);
+      return null;
+    }
+
+    return data?.node_id || null;
+  }
+
+  /**
+   * Get workflow node ID by workflow template and node type
+   */
+  async getWorkflowNodeIdByType(templateId: string, nodeType: string, nodeName?: string): Promise<string | null> {
+    let query = this.supabase
+      .from('workflow_nodes')
+      .select('id')
+      .eq('workflow_template_id', templateId)
+      .eq('node_type', nodeType)
+      .eq('is_active', true);
+
+    if (nodeName) {
+      query = query.eq('name', nodeName);
+    }
+
+    const { data, error } = await query.single();
+
+    if (error) {
+      this.logger.warn(`Could not find node ID for type: ${nodeType}`, error);
+      return null;
+    }
+
+    return data?.id || null;
   }
 
   /**

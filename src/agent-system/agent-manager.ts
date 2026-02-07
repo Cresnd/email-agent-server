@@ -222,28 +222,38 @@ export class AgentManager {
       // Update workflow step for Parsing Agent
       if (workflowExecutionId) {
         try {
-          await this.db.updateWorkflowExecutionStep(workflowExecutionId, 'agent_1', {
+          const nodeId = await this.db.getNodeIdByStepName(workflowExecutionId, 'Parsing Agent');
+          if (nodeId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, nodeId, {
             status: 'completed',
             input_data: {
-              email_content: context.email_content,
-              venue_prompts: parsingInput.venue_prompts,
-              guardrails: parsingInput.guardrails
+              // Only data the Parsing Agent actually uses
+              subject: context.email_content.subject,
+              message: context.email_content.message,
+              message_for_ai: context.email_content.message_for_ai,
+              customer_email: context.email_content.customer_email,
+              first_name: context.email_content.first_name,
+              last_name: context.email_content.last_name,
+              // The parser prompt is the key input for this agent
+              parser_prompt: parsingInput.venue_prompts.parser || parsingInput.venue_prompts.email_extractor
             },
             output_data: {
-              extraction_result: parsingOutput.extraction_result,
-              guardrail_status: parsingOutput.guardrail_status,
-              guardrail_violations: parsingOutput.guardrail_violations
+              // Only the actual output from this agent
+              intent: parsingOutput.extraction_result?.intent,
+              action: parsingOutput.extraction_result?.action,
+              extracted_data: parsingOutput.extraction_result,
+              guardrail_status: parsingOutput.guardrail_status
             },
             started_at: new Date(Date.now() - parsingTime).toISOString(),
             completed_at: new Date().toISOString(),
             output_processing_time_ms: parsingTime,
             output_confidence_score: parsingOutput.confidence_score
-          });
+            });
+          }
         } catch (error) {
           this.logger.warn('Failed to update workflow step for Parsing Agent', {
             error: error.message || error,
-            workflowExecutionId,
-            node_id: 'agent_1'
+            workflowExecutionId
           });
         }
       }
@@ -301,29 +311,37 @@ export class AgentManager {
       // Update workflow step for Business Logic Agent
       if (workflowExecutionId) {
         try {
-          await this.db.updateWorkflowExecutionStep(workflowExecutionId, 'agent_2', {
+          const nodeId = await this.db.getNodeIdByStepName(workflowExecutionId, 'Business Logic Agent');
+          if (nodeId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, nodeId, {
             status: 'completed',
             input_data: {
-              parsing_output: parsingOutput,
-              venue_settings: context.venue_settings,
-              venue_prompts: businessLogicInput.venue_prompts,
-              guardrails: businessLogicInput.guardrails
+              // Only data the Business Logic Agent actually uses
+              intent: parsingOutput.extraction_result?.intent,
+              action: parsingOutput.extraction_result?.action,
+              venue_name: context.venue_settings.venue_name,
+              // The business logic prompt is the key input
+              business_logic_prompt: businessLogicInput.venue_prompts.business_logic
             },
             output_data: {
-              decision: businessLogicOutput.decision,
-              guardrail_status: businessLogicOutput.guardrail_status,
-              guardrail_violations: businessLogicOutput.guardrail_violations
+              // Only the actual output from this agent
+              action_type: businessLogicOutput.decision.action_type,
+              reasoning: businessLogicOutput.decision.reasoning,
+              confidence: businessLogicOutput.decision.confidence,
+              requires_human_review: businessLogicOutput.decision.requires_human_review,
+              refined_extraction: businessLogicOutput.refined_extraction,
+              guardrail_status: businessLogicOutput.guardrail_status
             },
             started_at: new Date(Date.now() - businessLogicTime).toISOString(),
             completed_at: new Date().toISOString(),
             output_processing_time_ms: businessLogicTime,
             output_confidence_score: businessLogicOutput.decision.confidence
-          });
+            });
+          }
         } catch (error) {
           this.logger.warn('Failed to update workflow step for Business Logic Agent', {
             error: error.message || error,
-            workflowExecutionId,
-            node_id: 'agent_2'
+            workflowExecutionId
           });
         }
       }
@@ -353,6 +371,7 @@ export class AgentManager {
           first_name: parsingOutput.extraction_result.first_name,
           last_name: parsingOutput.extraction_result.last_name
         },
+        workflowExecutionId: workflowExecutionId, // Pass workflow ID for tool logging
         venue_settings: context.venue_settings,
         venue_prompts: {
           execution_prompt: this.getExecutionPrompt(businessLogicOutput.decision.action_type, context.venue_prompts)
@@ -384,32 +403,46 @@ export class AgentManager {
       // Update workflow step for Action Execution Agent
       if (workflowExecutionId) {
         try {
-          await this.db.updateWorkflowExecutionStep(workflowExecutionId, 'agent_3', {
+          const nodeId = await this.db.getNodeIdByStepName(workflowExecutionId, 'Action Execution Agent');
+          if (nodeId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, nodeId, {
             status: 'completed',
             input_data: {
-              business_logic_output: businessLogicOutput,
-              original_email: context.email_content,
-              venue_settings: context.venue_settings,
-              venue_prompts: actionExecutionInput.venue_prompts,
-              guardrails: actionExecutionInput.guardrails
+              // Only data the Action Execution Agent actually uses
+              action_type: businessLogicOutput.decision.action_type,
+              reasoning: businessLogicOutput.decision.reasoning,
+              refined_extraction: businessLogicOutput.refined_extraction,
+              original_subject: context.email_content.subject,
+              customer_email: context.email_content.customer_email,
+              message_for_ai: context.email_content.message_for_ai,
+              venue_name: context.venue_settings.venue_name,
+              venue_id: context.venue_settings.venue_id,
+              // The execution prompt is the key input
+              execution_prompt: actionExecutionInput.venue_prompts.execution_prompt
             },
             output_data: {
+              // Only the actual output from this agent
+              ai_response: actionExecutionOutput.ai_response,
               final_status: actionExecutionOutput.final_status,
               email_operations: actionExecutionOutput.email_operations,
-              tool_executions: actionExecutionOutput.tool_executions,
+              tool_executions: actionExecutionOutput.tool_executions?.map(t => ({
+                tool_name: t.tool_name,
+                success: t.success,
+                execution_time_ms: t.execution_time_ms,
+                error_message: t.error_message
+              })),
               guardrail_status: actionExecutionOutput.guardrail_status,
               guardrail_violations: actionExecutionOutput.guardrail_violations
             },
             started_at: new Date(Date.now() - actionExecutionTime).toISOString(),
             completed_at: new Date().toISOString(),
-            output_processing_time_ms: actionExecutionTime,
-            output_action_taken: actionExecutionOutput.final_status
-          });
+            output_processing_time_ms: actionExecutionTime
+            });
+          }
         } catch (error) {
           this.logger.warn('Failed to update workflow step for Action Execution Agent', {
             error: error.message || error,
-            workflowExecutionId,
-            node_id: 'agent_3'
+            workflowExecutionId
           });
         }
       }
