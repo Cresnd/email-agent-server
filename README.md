@@ -1,6 +1,6 @@
-# Cresnd Email Agent Server
+# Email Agent Server
 
-A deterministic, real-time workflow execution system for email processing and agent orchestration, designed to integrate with the Cresnd AI v2 platform.
+A deterministic, real-time workflow execution system for email processing and agent orchestration, designed to integrate with the Elyra AI v2 platform.
 
 ## Architecture Overview
 
@@ -9,7 +9,7 @@ This server implements an n8n-style workflow execution system specifically desig
 ## Project Structure
 
 ```
-cresnd-email-agent-server/
+email-agent-server/
 ├── src/                          # Source code
 │   ├── workflow-engine/          # Core workflow execution engine
 │   │   ├── executor.ts           # Main workflow execution logic
@@ -86,7 +86,7 @@ cresnd-email-agent-server/
 - **Database**: Supabase/PostgreSQL with real-time subscriptions
 - **Real-time**: WebSockets + Supabase Realtime
 - **Email**: IMAP/SMTP with OAuth support
-- **AI**: Integration with existing Cresnd AI agents
+- **AI**: Integration with existing Elyra AI agents
 - **Deployment**: Supabase Edge Functions + Docker
 
 ## Key Features
@@ -121,7 +121,7 @@ cresnd-email-agent-server/
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd cresnd-email-agent-server
+cd email-agent-server
 
 # Install dependencies
 deno install
@@ -137,9 +137,9 @@ deno run scripts/db-migrate.ts
 deno run --allow-all src/main.ts
 ```
 
-## Integration with Cresnd AI v2
+## Integration with Elyra AI v2
 
-This server integrates seamlessly with the main Cresnd AI v2 platform:
+This server integrates seamlessly with the main Elyra AI v2 platform:
 
 1. **Shared Database**: Uses the same Supabase instance for data consistency
 2. **Authentication**: Leverages existing Supabase Auth integration
@@ -211,4 +211,4 @@ See `docs/deployment/` for detailed deployment guides.
 
 ## License
 
-This project is part of the Cresnd AI platform. All rights reserved.
+This project is part of the Elyra AI platform. All rights reserved.

@@ -6,13 +6,19 @@
  */
 
 import { Application, Router } from "@oak/oak";
-import { config } from "@/config/environment.ts";
-import { DatabaseConnection } from "@/database/connection.ts";
-import { WorkflowExecutor } from "@/workflow-engine/executor.ts";
-import { WebSocketServer } from "@/realtime/websocket-server.ts";
-import { EmailProcessor } from "@/email-processing/router.ts";
-import { AgentManager } from "@/agent-system/agent-manager.ts";
-import { Logger } from "@/utils/logger.ts";
+import { config } from "./config/environment.ts";
+import { DatabaseConnection } from "./database/connection.ts";
+import { WorkflowExecutor } from "./workflow-engine/executor.ts";
+import { WebSocketServer } from "./realtime/websocket-server.ts";
+import { EmailProcessor } from "./email-processing/router.ts";
+import { AgentManager } from "./agent-system/agent-manager.ts";
+import { Logger, LogLevel } from "./utils/logger.ts";
+
+// Configure global log level from environment (e.g., LOG_LEVEL=debug)
+const envLogLevel = Deno.env.get('LOG_LEVEL') as LogLevel | undefined;
+if (envLogLevel) {
+  Logger.configure({ level: envLogLevel });
+}
 
 class EmailAgentServer {
   private app: Application;
@@ -41,17 +47,14 @@ class EmailAgentServer {
       await this.database.connect();
       this.logger.info('Database connection established');
 
-      // Initialize workflow executor
-      await this.workflowExecutor.initialize();
-      this.logger.info('Workflow executor initialized');
+      // Workflow executor ready (no initialization needed)
+      this.logger.info('Workflow executor ready');
 
-      // Initialize agent manager
-      await this.agentManager.initialize();
-      this.logger.info('Agent manager initialized');
+      // Agent manager ready (no initialization needed)
+      this.logger.info('Agent manager ready');
 
-      // Initialize email processor
-      await this.emailProcessor.initialize();
-      this.logger.info('Email processor initialized');
+      // Email processor ready (no initialization needed)
+      this.logger.info('Email processor ready');
 
       // Setup middleware
       this.setupMiddleware();
@@ -112,6 +115,7 @@ class EmailAgentServer {
 
   private setupRoutes(): void {
     const router = new Router();
+    const emailRouter = this.emailProcessor.getRouter();
 
     // Health check endpoint
     router.get('/health', (ctx) => {
@@ -203,21 +207,24 @@ class EmailAgentServer {
       ctx.response.body = { message: 'Manual email processing endpoint' };
     });
 
-    // Apply routes to the application
+    // Apply email processing routes
+    this.app.use(emailRouter.routes());
+    this.app.use(emailRouter.allowedMethods());
+
+    // Apply core routes to the application
     this.app.use(router.routes());
     this.app.use(router.allowedMethods());
   }
 
   async start(): Promise<void> {
-    const port = config.server.port;
-    const host = config.server.host;
+    const port = config?.server?.port || 8000;
+    const host = config?.server?.host || 'localhost';
 
     this.logger.info(`Starting Email Agent Server on ${host}:${port}`);
     
     await this.app.listen({ 
       port, 
-      hostname: host,
-      signal: AbortSignal.timeout(30000) // 30 second startup timeout
+      hostname: host
     });
   }
 
