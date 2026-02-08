@@ -6,10 +6,10 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { Logger } from "../utils/logger.ts";
 
 export interface DatabaseTool {
-  tool_id: string;
+  id: string;
   tool_name: string;
   tool_description: string;
-  tool_type: 'http_request' | 'postgres' | 'postgresTool' | 'workflow' | 'memory' | 'ai_model' | 'edge_function';
+  tool_type: 'http_request' | 'postgres' | 'postgresTool' | 'httpRequestTool' | 'workflow' | 'memory' | 'ai_model' | 'edge_function';
   method?: string;
   url?: string;
   authentication?: string;
@@ -17,6 +17,7 @@ export interface DatabaseTool {
   tool_body?: Record<string, any>;
   tool_headers?: Record<string, any>;
   tool_params?: Record<string, any>;
+  workflow_template_id?: string;
 }
 
 export interface ToolExecutionResult {
@@ -83,9 +84,20 @@ export class ToolLoader {
     workflowExecutionId?: string
   ): Promise<ToolExecutionResult> {
     const startTime = Date.now();
+    let toolStepId: string | null = null;
     
     try {
       this.logger.debug(`Executing tool: ${tool.tool_name}`, { tool_type: tool.tool_type });
+
+      // Step 1: Create tool step as 'pending' if workflowExecutionId provided
+      if (workflowExecutionId) {
+        toolStepId = await this.createPendingToolStep(workflowExecutionId, tool, { ...parameters, ...context });
+      }
+
+      // Step 2: Update to 'running' before execution starts
+      if (workflowExecutionId && toolStepId) {
+        await this.updateToolStepStatus(toolStepId, 'running', new Date().toISOString());
+      }
 
       let result: ToolExecutionResult;
       switch (tool.tool_type) {
@@ -106,9 +118,9 @@ export class ToolLoader {
           throw new Error(`Tool type ${tool.tool_type} not supported yet`);
       }
       
-      // Log tool execution with only used variables if workflowExecutionId provided
-      if (workflowExecutionId) {
-        await this.logToolExecution(workflowExecutionId, result, tool, { ...parameters, ...context });
+      // Step 3: Update to 'completed' after successful execution
+      if (workflowExecutionId && toolStepId) {
+        await this.updateToolStepCompletion(toolStepId, result);
       }
       
       return result;
@@ -123,9 +135,9 @@ export class ToolLoader {
         execution_time_ms: executionTime
       };
       
-      // Log failed tool execution
-      if (workflowExecutionId) {
-        await this.logToolExecution(workflowExecutionId, result, tool, { ...parameters, ...context });
+      // Step 3: Update to 'failed' after error
+      if (workflowExecutionId && toolStepId) {
+        await this.updateToolStepCompletion(toolStepId, result);
       }
       
       return result;
@@ -338,29 +350,26 @@ export class ToolLoader {
   }
 
   /**
-   * Log tool execution to database with only used variables
+   * Create a pending tool step before execution starts
    */
-  async logToolExecution(
+  private async createPendingToolStep(
     workflowExecutionId: string,
-    toolResult: ToolExecutionResult,
-    tool?: DatabaseTool,
-    context?: Record<string, any>
-  ): Promise<void> {
+    tool: DatabaseTool,
+    context: Record<string, any>
+  ): Promise<string> {
     try {
       // Extract only the variables that were actually used by this tool
       let inputData: Record<string, any> = {};
       
-      if (tool && context) {
-        if ((tool.tool_type === 'postgres' || tool.tool_type === 'postgresTool') && tool.tool_body?.query) {
-          inputData = this.extractUsedVariables(tool.tool_body.query, context);
-        } else if (tool.tool_type === 'http_request' || tool.tool_type === 'httpRequestTool') {
-          // Extract variables from URL and body
-          if (tool.url) {
-            Object.assign(inputData, this.extractUsedVariables(tool.url, context));
-          }
-          if (tool.tool_body) {
-            Object.assign(inputData, this.extractUsedVariables(JSON.stringify(tool.tool_body), context));
-          }
+      if ((tool.tool_type === 'postgres' || tool.tool_type === 'postgresTool') && tool.tool_body?.query) {
+        inputData = this.extractUsedVariables(tool.tool_body.query, context);
+      } else if (tool.tool_type === 'http_request' || tool.tool_type === 'httpRequestTool') {
+        // Extract variables from URL and body
+        if (tool.url) {
+          Object.assign(inputData, this.extractUsedVariables(tool.url, context));
+        }
+        if (tool.tool_body) {
+          Object.assign(inputData, this.extractUsedVariables(JSON.stringify(tool.tool_body), context));
         }
       }
 
@@ -375,27 +384,97 @@ export class ToolLoader {
 
       const nextStepOrder = (maxOrderData?.step_order || 0) + 1;
 
-      // Insert a new tool workflow step for the executed tool
-      await this.supabase
+      // Insert a new tool workflow step as 'pending'
+      const { data, error } = await this.supabase
         .from('workflow_execution_steps')
         .insert({
           execution_id: workflowExecutionId,
           step_order: nextStepOrder,
           step_type: 'tool',
-          step_name: toolResult.tool_name,
-          node_id: tool?.tool_id || `tool_${toolResult.tool_name}`,
+          step_name: tool.tool_name,
+          node_id: tool.id || `tool_${tool.tool_name}`,
+          status: 'pending',
+          input_data: inputData
+        })
+        .select('id')
+        .single();
+
+      if (error) {
+        throw new Error(`Failed to create pending tool step: ${error.message}`);
+      }
+
+      return data.id;
+    } catch (error) {
+      this.logger.warn('Failed to create pending tool step', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update tool step status (to 'running')
+   */
+  private async updateToolStepStatus(
+    toolStepId: string,
+    status: 'running',
+    startedAt: string
+  ): Promise<void> {
+    try {
+      const { error } = await this.supabase
+        .from('workflow_execution_steps')
+        .update({
+          status: status,
+          started_at: startedAt
+        })
+        .eq('id', toolStepId);
+
+      if (error) {
+        throw new Error(`Failed to update tool step status: ${error.message}`);
+      }
+    } catch (error) {
+      this.logger.warn('Failed to update tool step status', error);
+    }
+  }
+
+  /**
+   * Update tool step completion (to 'completed' or 'failed')
+   */
+  private async updateToolStepCompletion(
+    toolStepId: string,
+    toolResult: ToolExecutionResult
+  ): Promise<void> {
+    try {
+      const { error } = await this.supabase
+        .from('workflow_execution_steps')
+        .update({
           status: toolResult.success ? 'completed' : 'failed',
-          input_data: inputData, // Only the variables this tool actually used
           output_data: {
             result: toolResult.result,
             error: toolResult.error
           },
-          started_at: new Date(Date.now() - toolResult.execution_time_ms).toISOString(),
           completed_at: new Date().toISOString(),
           output_processing_time_ms: toolResult.execution_time_ms
-        });
+        })
+        .eq('id', toolStepId);
+
+      if (error) {
+        throw new Error(`Failed to update tool step completion: ${error.message}`);
+      }
     } catch (error) {
-      this.logger.warn('Failed to log tool execution', error);
+      this.logger.warn('Failed to update tool step completion', error);
     }
+  }
+
+  /**
+   * Log tool execution to database with only used variables (DEPRECATED - replaced by lifecycle methods)
+   */
+  async logToolExecution(
+    workflowExecutionId: string,
+    toolResult: ToolExecutionResult,
+    tool?: DatabaseTool,
+    context?: Record<string, any>
+  ): Promise<void> {
+    // This method is deprecated in favor of the new lifecycle tracking
+    // Keeping for backward compatibility but will not be used
+    this.logger.debug('logToolExecution called but using new lifecycle tracking instead');
   }
 }

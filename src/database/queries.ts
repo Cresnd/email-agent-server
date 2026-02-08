@@ -307,7 +307,6 @@ export class DatabaseQueries {
    */
   async createWorkflowExecution(executionData: {
     id: string;
-    execution_id?: string;
     workflow_id: string;
     organization_id: string;
     venue_id?: string;
@@ -324,10 +323,10 @@ export class DatabaseQueries {
       .from('workflow_executions')
       .insert({
         id: executionData.id,
-        execution_id: executionData.execution_id,
         workflow_id: executionData.workflow_id,
         organization_id: executionData.organization_id,
         venue_id: executionData.venue_id,
+        parent_execution: executionData.parent_execution,
         started_at: executionData.started_at,
         customer_email: executionData.customer_email,
         subject: executionData.subject,
@@ -726,18 +725,54 @@ export class DatabaseQueries {
    * Create workflow execution steps with node mapping only
    * Tools will be added dynamically when executed
    */
-  async createWorkflowExecutionSteps(executionId: string, templateId: string): Promise<void> {
+  async createWorkflowExecutionSteps(executionId: string, templateId: string, triggerData?: any, pinnedSteps?: Array<{id: string, step_name: string, node_id?: string, output_data: any, step_order: number}>): Promise<void> {
     const nodes = await this.getWorkflowNodes(templateId);
     
+    // Get the workflow execution trigger data if not provided
+    if (!triggerData) {
+      const { data: execution } = await this.supabase
+        .from('workflow_executions')
+        .select('trigger_data')
+        .eq('id', executionId)
+        .single();
+      triggerData = execution?.trigger_data;
+    }
+    
     // Create steps for nodes only - tools will be added when executed
-    const nodeSteps = nodes.map((node, index) => ({
-      execution_id: executionId,
-      step_order: index + 1,
-      step_type: node.node_type,
-      step_name: node.name,
-      node_id: node.id,
-      status: 'pending'
-    }));
+    const nodeSteps = nodes.map((node, index) => {
+      const stepOrder = index + 1;
+      
+      // Check if this step has pinned data
+      const pinnedStep = pinnedSteps?.find(ps => ps.node_id === node.id || ps.step_name === node.name || ps.step_order === stepOrder);
+      
+      const step: any = {
+        execution_id: executionId,
+        step_order: stepOrder,
+        step_type: node.node_type,
+        step_name: node.name,
+        node_id: node.id,
+        status: 'pending'
+      };
+
+      // Handle trigger step - set output_data from trigger_data and mark as completed
+      if (node.node_type === 'trigger' && triggerData) {
+        step.status = 'completed';
+        step.output_data = triggerData;
+        step.started_at = new Date().toISOString();
+        step.completed_at = new Date().toISOString();
+      }
+      
+      // Handle pinned steps
+      if (pinnedStep) {
+        step.status = 'completed';
+        step.output_data = pinnedStep.output_data;
+        step.output_pinned = true;
+        step.started_at = new Date().toISOString();
+        step.completed_at = new Date().toISOString();
+      }
+      
+      return step;
+    });
 
     const { error } = await this.supabase
       .from('workflow_execution_steps')
@@ -760,7 +795,7 @@ export class DatabaseQueries {
       output_data?: any;
       error_details?: any;
       started_at?: string;
-      finished_at?: string;
+      completed_at?: string;
       duration_ms?: number;
       ai_model_used?: string;
       confidence_score?: number;

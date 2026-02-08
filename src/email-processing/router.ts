@@ -30,10 +30,19 @@ export interface EmailProcessingRequest {
   attachments?: any[];
   
   // Execution metadata
+  execution_id?: string; // For reruns from edge function
   execution_type?: 'test' | 'normal';
   parent_execution_id?: string;
+  is_test_run?: boolean;
   message_id?: string;
   body?: string;
+  pinned_steps?: Array<{
+    id: string;
+    step_name: string;
+    node_id?: string;
+    output_data: any;
+    step_order: number;
+  }>;
 }
 
 export interface EmailProcessingResponse {
@@ -113,12 +122,31 @@ export class EmailProcessor {
     try {
       const body = await ctx.request.body({ type: 'json' }).value;
       
+      // Parse pinned steps from headers if present
+      const pinnedStepsHeader = ctx.request.headers.get('x-pinned-steps');
+      if (pinnedStepsHeader) {
+        try {
+          body.pinned_steps = JSON.parse(pinnedStepsHeader);
+          this.logger.info('Parsed pinned steps from headers', {
+            request_id: requestId,
+            pinned_count: body.pinned_steps?.length || 0
+          });
+        } catch (error) {
+          this.logger.warn('Failed to parse pinned steps header', { 
+            error: error.message,
+            header: pinnedStepsHeader 
+          });
+        }
+      }
+      
       this.logger.info(`Received ${source} webhook`, {
         request_id: requestId,
         venue_id: body.venue_id,
         email_account_id: body.email_account_id,
         subject: body.subject?.substring(0, 100),
-        from: body.from
+        from: body.from,
+        is_test_run: body.is_test_run,
+        pinned_steps_count: body.pinned_steps?.length || 0
       });
 
       // Process the email through the pipeline
@@ -283,44 +311,70 @@ export class EmailProcessor {
         workflow_id: venueWorkflowId
       });
       
-      // Create workflow execution record first (before agent pipeline)
-      const workflowExecutionId = crypto.randomUUID(); // Always use UUID for database
-      this.logger.info('Creating workflow execution record', { 
-        workflowExecutionId,
-        customer_email: emailPayload.from,
-        subject: emailPayload.subject,
-        workflow_id: venueWorkflowId
-      });
+      // Check if this is a rerun (has execution_id from edge function)
+      let workflowExecutionId: string;
+      let isRerun = false;
       
-      try {
-        await this.db.createWorkflowExecution({
-          id: workflowExecutionId,
-          execution_id: workflowExecutionId, // Will be updated with agent_run_id later
-          workflow_id: venueWorkflowId, // Dynamic workflow based on venue configuration
-          organization_id: venueConfig.venue_settings.organization_id,
-          venue_id: emailPayload.venue_id,
-          parent_execution: emailPayload.parent_execution_id || null,
-          started_at: new Date().toISOString(),
+      if (emailPayload.execution_id && emailPayload.parent_execution_id) {
+        // This is a rerun from the edge function - use the provided execution ID
+        workflowExecutionId = emailPayload.execution_id;
+        isRerun = true;
+        this.logger.info('Using existing execution ID from rerun', { 
+          workflowExecutionId,
+          parent_execution_id: emailPayload.parent_execution_id
+        });
+      } else if (emailPayload.execution_id) {
+        // Execution ID provided but no parent - use it as-is
+        workflowExecutionId = emailPayload.execution_id;
+        this.logger.info('Using provided execution ID', { 
+          workflowExecutionId
+        });
+      } else {
+        // Create new workflow execution record
+        workflowExecutionId = crypto.randomUUID();
+        this.logger.info('Creating new workflow execution record', { 
+          workflowExecutionId,
           customer_email: emailPayload.from,
           subject: emailPayload.subject,
-          trigger_type: emailPayload.execution_type === 'test' ? 'test' : 'email_webhook',
-          trigger_data: {
-            email_account_id: emailPayload.email_account_id,
-            subject: emailPayload.subject,
-            from: emailPayload.from,
-            to: emailPayload.to,
-            execution_type: emailPayload.execution_type || 'normal'
-          },
-          variables: {
-            processing_status: 'running'
-          }
+          workflow_id: venueWorkflowId
         });
-        
-        // Create workflow execution steps for the canvas to display
-        await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId);
-        this.logger.info('Workflow execution steps created successfully', { workflowExecutionId });
+      }
+      
+      try {
+        if (!isRerun) {
+          // Only create new execution if this is NOT a rerun
+          await this.db.createWorkflowExecution({
+            id: workflowExecutionId,
+            workflow_id: venueWorkflowId, // Dynamic workflow based on venue configuration
+            organization_id: venueConfig.venue_settings.organization_id,
+            venue_id: emailPayload.venue_id,
+            parent_execution: emailPayload.parent_execution_id || null,
+            started_at: new Date().toISOString(),
+            customer_email: emailPayload.from,
+            subject: emailPayload.subject,
+            trigger_type: emailPayload.execution_type === 'test' ? 'test' : 'email_webhook',
+            trigger_data: emailPayload, // Store the full webhook payload
+            variables: {
+              processing_status: 'running'
+            }
+          });
+          
+          // Create workflow execution steps for the canvas to display
+          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps);
+          this.logger.info('Workflow execution steps created successfully', { workflowExecutionId });
+        } else {
+          // For reruns, update the status to running and create steps
+          await this.db.updateWorkflowExecution(workflowExecutionId, {
+            status: 'running',
+            started_at: new Date().toISOString()
+          });
+          
+          // Create workflow execution steps for the canvas to display (reruns need steps too!)
+          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps);
+          this.logger.info('Rerun execution updated to running and steps created', { workflowExecutionId });
+        }
       } catch (error) {
-        this.logger.error('Failed to create workflow execution', { workflowExecutionId, error: error.message });
+        this.logger.error('Failed to create/update workflow execution', { workflowExecutionId, error: error.message });
       }
       
       // Phase 5: Execute 3-agent pipeline (with workflow execution ID)
