@@ -9,7 +9,7 @@ import { RetryManager } from './retry-manager.ts';
 
 export interface WorkflowStep {
   id: string;
-  type: 'email_classifier' | 'agent_selector' | 'agent_executor' | 'condition' | 'webhook' | 'delay' | 'guardrail';
+  type: 'email_classifier' | 'agent_selector' | 'agent_executor' | 'condition' | 'webhook' | 'delay' | 'guardrail' | 'send';
   name: string;
   config: Record<string, unknown>;
   nextSteps: string[];

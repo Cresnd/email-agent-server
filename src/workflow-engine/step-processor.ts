@@ -58,6 +58,10 @@ export class StepProcessor {
       case 'guardrail':
         output = await this.executeGuardrail(config, context);
         break;
+
+      case 'send':
+        output = await this.executeSend(config, context);
+        break;
         
       default:
         throw new Error(`Unknown step type: ${stepType}`);
@@ -382,5 +386,110 @@ export class StepProcessor {
       guardrail_type: guardrailType,
       guardrails_evaluated: guardrails.length
     };
+  }
+
+  /**
+   * Execute send email step
+   */
+  private async executeSend(
+    config: Record<string, unknown>,
+    context: ExecutionContext
+  ): Promise<Record<string, unknown>> {
+    
+    // Extract required data from context
+    const triggerData = context.triggerData as any;
+    const lastStepOutput = context.stepHistory[context.stepHistory.length - 1]?.output;
+    
+    // Get customer email from trigger node's output_data
+    const customerEmail = triggerData?.customer_email || triggerData?.from || '';
+    
+    // Get HTML message from the last executed node's output_data
+    const bodyHtml = lastStepOutput?.body_html || lastStepOutput?.ai_response?.body_html || '';
+    
+    // Extract email data from execution context
+    const emailData = {
+      to: customerEmail,
+      body_html: bodyHtml,
+      venue_id: context.venueId || '',
+      subject: config.subject as string || triggerData?.subject || 'Re: Your inquiry',
+      from: config.from as string || triggerData?.venue_email || '',
+      inReplyTo: triggerData?.message_id || '',
+      references: triggerData?.references || '',
+      folder_path: config.folder_path as string || 'Sent',
+      attachments: config.attachments as string || '',
+      outlook_id: triggerData?.outlook_id || ''
+    };
+
+    // Validate required fields
+    if (!emailData.to) {
+      throw new Error('Send node: No recipient email address found in trigger data');
+    }
+    
+    if (!emailData.body_html) {
+      throw new Error('Send node: No email content found in previous step output');
+    }
+
+    // Determine email service based on outlook_id presence
+    const isOutlook = !!emailData.outlook_id;
+    const baseUrl = 'http://172.17.0.1:3005'; // Email service base URL
+    const endpoint = isOutlook ? '/outlook/reply' : '/smtp/send';
+    const url = `${baseUrl}${endpoint}`;
+
+    try {
+      // Prepare request payload based on service type
+      let requestPayload: any;
+      
+      if (isOutlook) {
+        requestPayload = {
+          outlook_id: emailData.outlook_id,
+          to: emailData.to,
+          subject: emailData.subject,
+          body_html: emailData.body_html,
+          inReplyTo: emailData.inReplyTo,
+          references: emailData.references,
+          folder_path: emailData.folder_path,
+          attachments: emailData.attachments
+        };
+      } else {
+        requestPayload = {
+          venue_id: emailData.venue_id,
+          to: emailData.to,
+          subject: emailData.subject,
+          body_html: emailData.body_html,
+          from: emailData.from,
+          folder_path: emailData.folder_path,
+          attachments: emailData.attachments
+        };
+      }
+
+      // Send email via appropriate endpoint
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestPayload)
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Email sending failed (${response.status}): ${errorText}`);
+      }
+
+      const responseData = await response.json();
+
+      return {
+        status: 'sent',
+        service: isOutlook ? 'outlook' : 'smtp',
+        to: emailData.to,
+        subject: emailData.subject,
+        message_id: responseData.message_id || '',
+        sent_at: new Date().toISOString(),
+        response_data: responseData
+      };
+
+    } catch (error) {
+      throw new Error(`Send node execution failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
