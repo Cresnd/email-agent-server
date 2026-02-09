@@ -50,18 +50,13 @@ export interface VenueConfiguration {
     confirmation_templates?: string;
     error_handling?: string;
   };
-  guardrails: {
-    parsing_guardrails?: Array<{
-      name: string;
-      prompt: string;
-      threshold: number;
-    }>;
-    business_logic_guardrails?: Array<{
-      name: string;
-      prompt: string;
-      threshold: number;
-    }>;
-  };
+  guardrails: Record<string, Array<{
+    name: string;
+    prompt: string;
+    threshold: number;
+    folder_path?: string;
+    mark_as_seen?: boolean;
+  }>>;
   email_infrastructure: {
     email_account: string;
     smtp_settings: any;
@@ -422,10 +417,7 @@ export class EmailPipelineOrchestrator {
       return {};
     }
 
-    return {
-      parsing_guardrails: guardrailsData.parsing_guardrails || [],
-      business_logic_guardrails: guardrailsData.business_logic_guardrails || []
-    };
+    return guardrailsData;
   }
 
   private parseEmailInfrastructure(infraData: any): VenueConfiguration['email_infrastructure'] {

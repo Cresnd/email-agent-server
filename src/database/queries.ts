@@ -526,7 +526,7 @@ export class DatabaseQueries {
         this.logger.warn(`Venue guardrails query failed: ${guardrailError.message}`, { venue_id: venueId });
       }
 
-      // Process prompts by type
+      // Process prompts by type - keyed by template.type as objects {prompt, checksum}
       const venuePrompts: Record<string, any> = {};
       if (promptData) {
         promptData.forEach((item: any) => {
@@ -676,7 +676,6 @@ export class DatabaseQueries {
       .from('workflow_nodes')
       .select('*')
       .eq('workflow_template_id', templateId)
-      .eq('is_active', true)
       .order('position_x');
 
     if (error) {
@@ -694,7 +693,6 @@ export class DatabaseQueries {
       .from('workflow_connections')
       .select('*')
       .eq('workflow_template_id', templateId)
-      .eq('is_active', true)
       .order('created_at');
 
     if (error) {
@@ -725,7 +723,7 @@ export class DatabaseQueries {
    * Create workflow execution steps with node mapping only
    * Tools will be added dynamically when executed
    */
-  async createWorkflowExecutionSteps(executionId: string, templateId: string, triggerData?: any, pinnedSteps?: Array<{id: string, step_name: string, node_id?: string, output_data: any, step_order: number}>): Promise<void> {
+  async createWorkflowExecutionSteps(executionId: string, templateId: string, triggerData?: any, pinnedSteps?: Array<{id: string, step_name: string, node_id?: string, output_data: any, step_order: number}>, triggerOutputData?: Record<string, any>): Promise<void> {
     const nodes = await this.getWorkflowNodes(templateId);
     
     // Get the workflow execution trigger data if not provided
@@ -754,10 +752,13 @@ export class DatabaseQueries {
         status: 'pending'
       };
 
-      // Handle trigger step - set output_data from trigger_data and mark as completed
-      if (node.node_type === 'trigger' && triggerData) {
+      // Handle trigger step:
+      //   input_data  = raw webhook payload (triggerData)
+      //   output_data = venue config wall (triggerOutputData) with all assembled data
+      if (node.node_type === 'trigger') {
         step.status = 'completed';
-        step.output_data = triggerData;
+        step.input_data = triggerData || null;
+        step.output_data = triggerOutputData || triggerData || null;
         step.started_at = new Date().toISOString();
         step.completed_at = new Date().toISOString();
       }
@@ -783,6 +784,21 @@ export class DatabaseQueries {
     }
   }
 
+  async getTriggerStepOutputData(executionId: string): Promise<Record<string, any> | null> {
+    const { data, error } = await this.supabase
+      .from('workflow_execution_steps')
+      .select('output_data')
+      .eq('execution_id', executionId)
+      .eq('step_type', 'trigger')
+      .single();
+
+    if (error) {
+      return null;
+    }
+
+    return data?.output_data || null;
+  }
+
   /**
    * Update workflow execution step with input/output and node_id
    */
@@ -798,9 +814,9 @@ export class DatabaseQueries {
       completed_at?: string;
       duration_ms?: number;
       ai_model_used?: string;
-      confidence_score?: number;
+      output_confidence_score?: number;
       tokens_used?: number;
-      processing_time_ms?: number;
+      output_processing_time_ms?: number;
       ai_call_time_ms?: number;
       db_query_time_ms?: number;
     }
@@ -900,6 +916,63 @@ export class DatabaseQueries {
     }
 
     return data?.id || null;
+  }
+
+  async createGuardrailExecutionSteps(
+    executionId: string,
+    nodeId: string,
+    guardrailResults: Array<{
+      guardrail_name: string;
+      confidence: number;
+      guardrail_threshold: number;
+      passed: boolean;
+      started_at: string;
+      completed_at: string;
+      model?: string;
+    }>
+  ): Promise<void> {
+    if (!guardrailResults || guardrailResults.length === 0) return;
+
+    const { data: maxOrder } = await this.supabase
+      .from('workflow_execution_steps')
+      .select('step_order')
+      .eq('execution_id', executionId)
+      .order('step_order', { ascending: false })
+      .limit(1)
+      .single();
+
+    const baseOrder = (maxOrder?.step_order || 0) + 1;
+
+    const steps = guardrailResults.map((result, index) => ({
+      execution_id: executionId,
+      step_order: baseOrder + index,
+      step_type: 'guardrail',
+      step_name: result.guardrail_name,
+      node_id: nodeId,
+      status: 'completed' as const,
+      input_data: {
+        guardrail_name: result.guardrail_name,
+        threshold: result.guardrail_threshold
+      },
+      output_data: {
+        confidence: result.confidence,
+        threshold: result.guardrail_threshold,
+        passed: result.passed,
+        guardrail_name: result.guardrail_name
+      },
+      started_at: result.started_at,
+      completed_at: result.completed_at,
+      confidence_score: result.confidence,
+      ai_model_used: result.model
+    }));
+
+    const { error } = await this.supabase
+      .from('workflow_execution_steps')
+      .insert(steps);
+
+    if (error) {
+      this.logger.error('Failed to create guardrail execution steps', error);
+    }
   }
 
   /**

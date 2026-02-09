@@ -274,6 +274,69 @@ export class EmailProcessor {
         prompts_keys: Object.keys(venueConfig.venue_prompts || {}),
         guardrails_count: Object.keys(venueConfig.guardrails || {}).length
       });
+
+      // Phase 2.5: Fetch type-based prompts & guardrails for the venue config wall
+      const promptsAndGuardrails = await this.db.getVenuePromptsAndGuardrailsByType(preprocessedData.venue_id);
+
+      // Build the venue config "wall" - all data assembled as a flat object
+      // This becomes the trigger step output_data so downstream steps can reference
+      // variables like {{subject}}, {{guardrails.post_intent_guardrails[0].name}}, etc.
+      const venueTimezone = venueConfig.venue_settings?.venue_timezone || 'Europe/Stockholm';
+      const nowFormatted = (() => {
+        try {
+          const now = new Date();
+          const day = now.toLocaleDateString('en-US', { timeZone: venueTimezone, day: 'numeric' });
+          const month = now.toLocaleDateString('en-US', { timeZone: venueTimezone, month: 'long' });
+          const year = now.toLocaleDateString('en-US', { timeZone: venueTimezone, year: 'numeric' });
+          const hours = now.toLocaleString('en-US', { timeZone: venueTimezone, hour: '2-digit', minute: '2-digit', hour12: false });
+          const ordinal = (n: number) => {
+            const s = ['th', 'st', 'nd', 'rd'];
+            const v = n % 100;
+            return n + (s[(v - 20) % 10] || s[v] || s[0]);
+          };
+          return `The ${ordinal(parseInt(day))} of ${month} ${year} at ${hours} o'clock`;
+        } catch {
+          return new Date().toISOString();
+        }
+      })();
+
+      const venueConfigWall: Record<string, any> = {
+        venue_prompts: promptsAndGuardrails.venue_prompts || {},
+        guardrails: promptsAndGuardrails.guardrails || {},
+        email_addresses_ignore: venueConfig.filtering_config?.ignored_emails || [],
+        domains_ignore: venueConfig.filtering_config?.ignored_domains || [],
+        standard_sorting_rules: {},
+        workflows: {},
+        database_project_ref: Deno.env.get('SUPABASE_PROJECT_REF') || '',
+        finance_email: venueConfig.venue_settings?.finance_email || '',
+        session_id: '',
+        phone_number: '',
+        now: nowFormatted,
+        venue_id: preprocessedData.venue_id,
+        venue_name: venueConfig.venue_settings?.venue_name || '',
+        venue_address: venueConfig.venue_settings?.venue_address || '',
+        venue_description: venueConfig.venue_settings?.venue_description || '',
+        venue_timezone: venueTimezone,
+        organization_id: venueConfig.venue_settings?.organization_id || '',
+        organization_name: venueConfig.venue_settings?.organization_name || '',
+        references: preprocessedData.metadata?.references || '',
+        in_reply_to: preprocessedData.metadata?.in_reply_to || '',
+        conversation_id: preprocessedData.email_content?.conversation_id || '',
+        email_UID: preprocessedData.metadata?.email_UID || 0,
+        outlook_id: preprocessedData.metadata?.outlook_id || '',
+        first_name: preprocessedData.email_content?.first_name || '',
+        last_name: preprocessedData.email_content?.last_name || '',
+        customer_email: preprocessedData.email_content?.customer_email || '',
+        company_email: emailPayload.to || '',
+        subject: preprocessedData.email_content?.subject || '',
+        subject_tag: '',
+        message: preprocessedData.email_content?.message || '',
+        message_for_ai: preprocessedData.email_content?.message_for_ai || '',
+        attachments: preprocessedData.email_content?.attachments || '',
+        received_at: preprocessedData.email_content?.received_at || '',
+        email_server: venueConfig.email_infrastructure || {},
+        email_delay: 0
+      };
       
       // Phase 3: Apply email filtering and guardrails
       this.logger.debug('Applying email filters and guardrails', { request_id: requestId });
@@ -353,14 +416,16 @@ export class EmailProcessor {
             customer_email: emailPayload.from,
             subject: emailPayload.subject,
             trigger_type: emailPayload.execution_type === 'test' ? 'test' : 'email_webhook',
-            trigger_data: emailPayload, // Store the full webhook payload
+            trigger_data: emailPayload, // Store the raw webhook payload as input
             variables: {
-              processing_status: 'running'
+              processing_status: 'running',
+              ...venueConfigWall
             }
           });
           
           // Create workflow execution steps for the canvas to display
-          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps);
+          // Trigger step gets: input_data = raw webhook, output_data = venue config wall
+          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps, venueConfigWall);
           this.logger.info('Workflow execution steps created successfully', { workflowExecutionId });
         } else {
           // For reruns, update the status to running and create steps
@@ -370,7 +435,7 @@ export class EmailProcessor {
           });
           
           // Create workflow execution steps for the canvas to display (reruns need steps too!)
-          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps);
+          await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps, venueConfigWall);
           this.logger.info('Rerun execution updated to running and steps created', { workflowExecutionId });
         }
       } catch (error) {

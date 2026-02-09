@@ -4,6 +4,7 @@
  */
 
 import { ExecutionContext } from './executor.ts';
+import { GuardrailExecutor, GuardrailDefinition } from './guardrail-executor.ts';
 
 export interface StepResult {
   input: Record<string, unknown>;
@@ -11,7 +12,12 @@ export interface StepResult {
 }
 
 export class StepProcessor {
-  
+  private guardrailExecutor: GuardrailExecutor;
+
+  constructor() {
+    this.guardrailExecutor = new GuardrailExecutor();
+  }
+
   /**
    * Execute a workflow step based on its type
    */
@@ -47,6 +53,10 @@ export class StepProcessor {
         
       case 'delay':
         output = await this.executeDelay(config, context);
+        break;
+
+      case 'guardrail':
+        output = await this.executeGuardrail(config, context);
         break;
         
       default:
@@ -341,6 +351,36 @@ export class StepProcessor {
       venue_id: venueId,
       name: 'Mock Venue',
       settings: {}
+    };
+  }
+
+  private async executeGuardrail(
+    config: Record<string, unknown>,
+    context: ExecutionContext
+  ): Promise<Record<string, unknown>> {
+    const guardrailType = config.guardrail_type as string;
+    const guardrailsKey = `${guardrailType}_guardrails`;
+    const guardrails = (context.variables.guardrails as any)?.[guardrailsKey] as GuardrailDefinition[] | undefined;
+
+    if (!guardrails || guardrails.length === 0) {
+      return { continue: true, guardrail_type: guardrailType, message: 'No guardrails configured' };
+    }
+
+    const emailData = context.variables.email as any;
+    const result = await this.guardrailExecutor.executeGuardrails(guardrails, {
+      guardrail_type: guardrailType,
+      system_prompt: config.system_prompt as string | undefined,
+      model: config.model as string | undefined,
+      content_to_evaluate: {
+        subject: emailData?.subject || '',
+        message_for_ai: emailData?.message_for_ai || emailData?.body || ''
+      }
+    });
+
+    return {
+      ...result,
+      guardrail_type: guardrailType,
+      guardrails_evaluated: guardrails.length
     };
   }
 }

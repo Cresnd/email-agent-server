@@ -31,6 +31,14 @@ export class VariableManager {
       __timestamp: new Date().toISOString(),
       __status: context.status
     };
+
+    // Expose guardrail types as top-level variables for template resolution
+    const guardrails = context.variables.guardrails as Record<string, unknown> | undefined;
+    if (guardrails) {
+      for (const [key, value] of Object.entries(guardrails)) {
+        context.variables[key] = value;
+      }
+    }
   }
 
   /**
@@ -169,11 +177,15 @@ export class VariableManager {
   private resolveString(str: string, variables: Record<string, unknown>): string {
     // Handle ${variable} and {{variable}} syntax
     return str.replace(/\$\{([^}]+)\}|\{\{([^}]+)\}\}/g, (match, dollarVar, braceVar) => {
-      const variableName = dollarVar || braceVar;
+      const variableName = (dollarVar || braceVar).trim();
       const value = this.resolveVariablePath(variables, variableName);
       
       if (value === undefined || value === null) {
         return match; // Keep original if variable not found
+      }
+
+      if (typeof value === 'object') {
+        return JSON.stringify(value);
       }
       
       return String(value);
