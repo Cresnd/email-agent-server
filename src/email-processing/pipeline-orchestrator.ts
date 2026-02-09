@@ -172,20 +172,6 @@ export class EmailPipelineOrchestrator {
         return ignoredCheck;
       }
 
-      // Phase 3.2: Email Sorting Rules Check
-      const sortingCheck = this.checkSortingRules(
-        emailData.email_content.customer_email,
-        venueConfig.filtering_config
-      );
-      
-      if (!sortingCheck.continue) {
-        this.logger.info('Email sorted to specific folder', {
-          customer_email: emailData.email_content.customer_email,
-          folder: sortingCheck.email_operations?.moved_to_folder
-        });
-        return sortingCheck;
-      }
-
       // Phase 4.1: Subject Line Guardrails
       const subjectGuardrails = await this.validateSubjectGuardrails(
         emailData.email_content.subject,

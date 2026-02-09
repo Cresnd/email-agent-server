@@ -247,9 +247,23 @@ export class AgentManager {
         executionVariables.step[key] = outputData;
       };
 
-      // Walk through the workflow graph in order, executing each step
-      for (const step of orderedSteps) {
-        if (step.node_type === 'trigger') continue;
+      // Walk the workflow graph following connections based on node output
+      const nodeMap = this.buildNodeMap(workflowNodes);
+      const executionQueue: any[] = [];
+      const executedNodes = new Set<string>();
+
+      // Find trigger node and seed queue with its outgoing connections
+      const triggerNode = workflowNodes.find(n => n.node_type === 'trigger');
+      if (triggerNode) {
+        const nextNodes = this.getNextNodes(triggerNode.id, 'node_output', workflowConnections, nodeMap);
+        executionQueue.push(...nextNodes);
+        executedNodes.add(triggerNode.id);
+      }
+
+      while (executionQueue.length > 0) {
+        const step = executionQueue.shift()!;
+        if (executedNodes.has(step.id)) continue;
+        executedNodes.add(step.id);
 
         if (step.node_type === 'guardrail') {
           const guardrailType = step.guardrail_type as string;
@@ -262,13 +276,16 @@ export class AgentManager {
           const guardrailsKey = keyMap[guardrailType] || `${guardrailType}_guardrails`;
           const guardrailDefs = (context.guardrails as any)?.[guardrailsKey] as GuardrailDefinition[] | undefined;
 
+          let guardrailPassed = true;
+
           if (guardrailDefs && guardrailDefs.length > 0) {
-            // Resolve {{variable}} placeholders in the node's prompt using execution variables
             const nodePrompt = step.prompt || '';
             const resolvedNodePrompt = nodePrompt ? this.variableManager.resolveVariables(
               { prompt: nodePrompt },
               executionVariables
             ).prompt as string : undefined;
+
+            const systemPrompt = this.resolveSystemPrompt(step.system_prompt_type, context.venue_prompts);
 
             const guardrailOutput = await this.executeAndSaveGuardrailNode(
               guardrailType,
@@ -277,10 +294,13 @@ export class AgentManager {
               workflowExecutionId,
               step.id,
               resolvedNodePrompt || undefined,
-              executionVariables
+              executionVariables,
+              systemPrompt,
+              step.model || undefined
             );
             registerStepOutput(step.name, guardrailOutput);
-            processingNotes.push(`Guardrail node "${step.name}" (${guardrailType}) evaluated`);
+            guardrailPassed = guardrailOutput.continue;
+            processingNotes.push(`Guardrail node "${step.name}" (${guardrailType}) evaluated - ${guardrailPassed ? 'passed' : 'violation detected'}`);
           } else {
             const skipOutput = { continue: true, message: 'No guardrails configured for this type' };
             if (workflowExecutionId) {
@@ -294,13 +314,141 @@ export class AgentManager {
             registerStepOutput(step.name, skipOutput);
             processingNotes.push(`Guardrail node "${step.name}" skipped (no guardrails configured)`);
           }
+
+          const handle = guardrailPassed ? 'positive_node_output' : 'negative_node_output';
+          const nextNodes = this.getNextNodes(step.id, handle, workflowConnections, nodeMap);
+          this.logger.info('Guardrail routing', {
+            node: step.name,
+            passed: guardrailPassed,
+            handle,
+            next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
+          });
+          executionQueue.push(...nextNodes);
           continue;
+        }
+
+        if (step.node_type === 'condition') {
+          const conditionType = step.condition_type as string;
+          let conditionPassed = false;
+          let conditionOutput: Record<string, any> = { continue: true };
+
+          if (conditionType === 'email_sorting') {
+            const rawRules = executionVariables.email_sorting_rules;
+            let sortingRules: any[] = [];
+            if (typeof rawRules === 'string') {
+              try { sortingRules = JSON.parse(rawRules); } catch { sortingRules = []; }
+            } else if (Array.isArray(rawRules)) {
+              sortingRules = rawRules;
+            }
+
+            const customerEmail = (executionVariables.customer_email || '').toLowerCase().trim();
+            const matchedRule = sortingRules.find((rule: any) =>
+              rule.email_address && customerEmail === rule.email_address.toLowerCase().trim()
+            );
+
+            conditionPassed = !!matchedRule;
+            conditionOutput = {
+              continue: !conditionPassed,
+              condition_type: conditionType,
+              customer_email: customerEmail,
+              rules_evaluated: sortingRules.length,
+              matched: conditionPassed,
+              matched_rule: matchedRule || null,
+              folder_path: matchedRule?.folder_path,
+              mark_as_seen: matchedRule?.mark_as_seen
+            };
+          }
+
+          if (workflowExecutionId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+              status: 'completed',
+              output_data: conditionOutput,
+              started_at: new Date().toISOString(),
+              completed_at: new Date().toISOString()
+            });
+          }
+          registerStepOutput(step.name, conditionOutput);
+
+          const handle = conditionPassed ? 'negative_node_output' : 'positive_node_output';
+          const nextNodes = this.getNextNodes(step.id, handle, workflowConnections, nodeMap);
+          this.logger.info('Condition routing', {
+            node: step.name,
+            condition_type: conditionType,
+            matched: conditionPassed,
+            handle,
+            next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
+          });
+          processingNotes.push(`Condition node "${step.name}" (${conditionType}) evaluated - ${conditionPassed ? 'matched' : 'no match'}`);
+          executionQueue.push(...nextNodes);
+          continue;
+        }
+
+        if (step.node_type === 'move') {
+          const lastGuardrailOutput = this.findLastGuardrailViolation(executionVariables.step || {});
+          const lastConditionMatch = this.findLastConditionMatch(executionVariables.step || {});
+
+          let folderPath: string;
+          let markAsSeen: boolean;
+          let reason: string;
+
+          if (lastConditionMatch) {
+            folderPath = lastConditionMatch.folder_path || 'sorted';
+            markAsSeen = lastConditionMatch.mark_as_seen ?? true;
+            reason = `Condition match: ${lastConditionMatch.matched_rule?.email_address || 'unknown'}`;
+          } else {
+            folderPath = lastGuardrailOutput?.violation?.folder_path || lastGuardrailOutput?.folder_path || 'guardrail_violations';
+            markAsSeen = lastGuardrailOutput?.violation?.mark_as_seen ?? lastGuardrailOutput?.mark_as_seen ?? true;
+            reason = `Guardrail violation: ${lastGuardrailOutput?.violation?.guardrail_name || 'unknown'}`;
+          }
+
+          const moveOutput = {
+            action: 'move',
+            folder_path: folderPath,
+            mark_as_seen: markAsSeen,
+            reason
+          };
+
+          if (workflowExecutionId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+              status: 'completed',
+              output_data: moveOutput,
+              started_at: new Date().toISOString(),
+              completed_at: new Date().toISOString()
+            });
+          }
+          registerStepOutput(step.name, moveOutput);
+          processingNotes.push(`Move node executed: folder=${folderPath}, mark_as_seen=${markAsSeen}`);
+          this.logger.info('Move node executed', moveOutput);
+
+          // Pipeline ends here — build a result with the move operation
+          const totalExecutionTime = Date.now() - startTime;
+          return {
+            success: true,
+            agent_run_id: agentRunId,
+            total_execution_time_ms: totalExecutionTime,
+            agent_execution_times: { parsing_agent_ms: 0, business_logic_agent_ms: 0, action_execution_agent_ms: 0 },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            processing_notes: processingNotes,
+            action_execution_output: {
+              final_status: lastConditionMatch ? 'email_sorted' : 'guardrail_violation',
+              ai_response: null,
+              email_operations: {
+                send_response: false,
+                move_to_folder: folderPath,
+                mark_as_seen: markAsSeen,
+                create_draft: false
+              },
+              tool_executions: [],
+              guardrail_status: lastConditionMatch ? 'sorted' : 'violated',
+              guardrail_violations: lastConditionMatch ? [] : [lastGuardrailOutput?.violation || {}]
+            } as any
+          };
         }
 
         if (step.node_type === 'agent') {
           const nameLower = (step.name || '').toLowerCase();
 
-          // Resolve {{variable}} placeholders in agent node's prompt if present
           let resolvedAgentPrompt: string | undefined;
           if (step.prompt && Object.keys(executionVariables).length > 0) {
             resolvedAgentPrompt = this.variableManager.resolveVariables(
@@ -314,7 +462,7 @@ export class AgentManager {
             const parsingStartTime = Date.now();
             const parsingInput: ParsingAgentInput = {
               email_content: context.email_content,
-              venue_prompts: { email_extractor: context.venue_prompts.parser || context.venue_prompts.email_extractor },
+              venue_prompts: { email_extractor: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.parser || context.venue_prompts.email_extractor },
               guardrails: { intent_guardrails: context.guardrails.pre_intent_guardrails }
             };
             parsingOutput = await this.executeWithLogging('parsing', agentRunId, () => this.parsingAgent.process(parsingInput));
@@ -358,7 +506,7 @@ export class AgentManager {
             const businessLogicInput: BusinessLogicAgentInput = {
               parsing_output: parsingOutput,
               venue_settings: context.venue_settings,
-              venue_prompts: { orchestrator: context.venue_prompts.business_logic || context.venue_prompts.orchestrator },
+              venue_prompts: { orchestrator: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.business_logic || context.venue_prompts.orchestrator },
               guardrails: { post_intent_guardrails: context.guardrails.post_intent_guardrails },
               current_bookings: [],
               availability_data: null
@@ -406,7 +554,7 @@ export class AgentManager {
               customer_data: { first_name: parsingOutput.extraction_result.first_name, last_name: parsingOutput.extraction_result.last_name },
               workflowExecutionId: workflowExecutionId,
               venue_settings: context.venue_settings,
-              venue_prompts: { execution_prompt: this.getExecutionPrompt(businessLogicOutput.decision.action_type, context.venue_prompts) },
+              venue_prompts: { execution_prompt: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || this.getExecutionPrompt(businessLogicOutput.decision.action_type, context.venue_prompts) },
               guardrails: { final_check_guardrails: context.guardrails.final_check_guardrails },
               email_infrastructure: context.email_infrastructure
             };
@@ -455,6 +603,9 @@ export class AgentManager {
           } else {
             this.logger.warn('Unknown agent node, skipping', { name: step.name, id: step.id });
           }
+
+          const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
+          executionQueue.push(...nextNodes);
           continue;
         }
       }
@@ -624,6 +775,22 @@ export class AgentManager {
     return venuePrompts.execution || venuePrompts.make_booking || venuePrompts[actionType];
   }
 
+  private resolveSystemPrompt(systemPromptType: string | undefined, venuePrompts: Record<string, any>): string | undefined {
+    if (!systemPromptType) return undefined;
+    const data = this.resolveSystemPromptData(systemPromptType, venuePrompts);
+    return data?.prompt;
+  }
+
+  private resolveSystemPromptData(systemPromptType: string | undefined, venuePrompts: Record<string, any>): { prompt: string; checksum: string } | undefined {
+    if (!systemPromptType) return undefined;
+    for (const [, promptData] of Object.entries(venuePrompts)) {
+      if (promptData?.template_id === systemPromptType && promptData?.prompt) {
+        return { prompt: promptData.prompt, checksum: promptData.checksum };
+      }
+    }
+    return undefined;
+  }
+
   private buildExecutionOrder(nodes: any[], connections: any[]): any[] {
     const adjacency = new Map<string, string[]>();
     const inDegree = new Map<string, number>();
@@ -665,6 +832,49 @@ export class AgentManager {
     return ordered;
   }
 
+  private getNextNodes(
+    currentNodeId: string,
+    sourceHandle: string,
+    connections: any[],
+    nodeMap: Map<string, any>
+  ): any[] {
+    return connections
+      .filter(c => {
+        const src = c.source_node_id || c.sourceNodeId;
+        return src === currentNodeId && c.source_handle === sourceHandle;
+      })
+      .map(c => nodeMap.get(c.target_node_id || c.targetNodeId))
+      .filter(Boolean);
+  }
+
+  private findLastConditionMatch(stepOutputs: Record<string, any>): any | null {
+    for (const key of Object.keys(stepOutputs).reverse()) {
+      const output = stepOutputs[key];
+      if (output && output.matched === true && output.condition_type) {
+        return output;
+      }
+    }
+    return null;
+  }
+
+  private findLastGuardrailViolation(stepOutputs: Record<string, any>): any | null {
+    for (const key of Object.keys(stepOutputs).reverse()) {
+      const output = stepOutputs[key];
+      if (output && output.continue === false && output.violation) {
+        return output;
+      }
+    }
+    return null;
+  }
+
+  private buildNodeMap(nodes: any[]): Map<string, any> {
+    const map = new Map<string, any>();
+    for (const node of nodes) {
+      map.set(node.id, node);
+    }
+    return map;
+  }
+
   private async executeAndSaveGuardrailNode(
     guardrailType: string,
     guardrails: GuardrailDefinition[],
@@ -672,7 +882,9 @@ export class AgentManager {
     workflowExecutionId?: string,
     guardrailNodeId?: string,
     nodePromptTemplate?: string,
-    executionVariables?: Record<string, any>
+    executionVariables?: Record<string, any>,
+    systemPrompt?: string,
+    model?: string
   ): Promise<Record<string, any>> {
     const startTime = Date.now();
 
@@ -688,7 +900,9 @@ export class AgentManager {
         guardrail_type: guardrailType,
         content_to_evaluate: content,
         node_prompt_template: nodePromptTemplate,
-        execution_variables: executionVariables
+        execution_variables: executionVariables,
+        system_prompt: systemPrompt,
+        model: model
       });
 
       const duration = Date.now() - startTime;
@@ -701,7 +915,9 @@ export class AgentManager {
         violation: result.continue ? null : {
           guardrail_name: result.guardrail_name,
           confidence: result.confidence,
-          threshold: result.guardrail_threshold
+          threshold: result.guardrail_threshold,
+          folder_path: result.folder_path,
+          mark_as_seen: result.mark_as_seen
         }
       };
 

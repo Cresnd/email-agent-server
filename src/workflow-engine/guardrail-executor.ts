@@ -152,7 +152,8 @@ export class GuardrailExecutor {
           name: guardrail.name,
           prompt: guardrail.prompt,
           threshold: guardrail.threshold
-        }
+        },
+        content_to_evaluate: contentToEvaluate
       };
       userPrompt = this.variableManager.resolveVariables(
         { prompt: config.node_prompt_template },
@@ -177,6 +178,15 @@ export class GuardrailExecutor {
         contentToEvaluate
       ].join('\n');
     }
+
+    this.logger.info('Guardrail prompt constructed', {
+      guardrail_name: guardrail.name,
+      has_node_prompt_template: !!config.node_prompt_template,
+      system_prompt_length: (config.system_prompt || GUARDRAIL_SYSTEM_PROMPT).length,
+      user_prompt_length: userPrompt.length,
+      user_prompt_preview: userPrompt.substring(0, 500),
+      content_to_evaluate_preview: contentToEvaluate.substring(0, 200)
+    });
 
     const model = config.model || 'gpt-4o-mini';
     const apiKey = Deno.env.get('OPENAI_API_KEY');
@@ -222,9 +232,18 @@ export class GuardrailExecutor {
 
       const parsed = JSON.parse(content);
 
+      this.logger.info('Guardrail LLM response', {
+        guardrail_name: guardrail.name,
+        raw_response: content,
+        parsed_confidence: parsed.confidence,
+        model
+      });
+
+      const confidence = parsed.confidence ?? parsed.confidence_score ?? 0;
+
       return {
         guardrail_name: parsed.guardrail_name || guardrail.name,
-        confidence: Number(parsed.confidence) || 0,
+        confidence: Number(confidence),
         guardrail_threshold: Number(parsed.guardrail_threshold) || guardrail.threshold
       };
     } catch (error) {

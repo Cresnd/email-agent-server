@@ -418,17 +418,6 @@ export class EmailWebhookIngestion {
       };
     }
 
-    // Check email sorting rules
-    for (const rule of venueConfig.email_sorting_rules) {
-      if (rule.email_address === emailData.customer_email) {
-        return {
-          shouldExit: true,
-          action: 'sort',
-          reason: `Email sorted to folder: ${rule.folder_path}`
-        };
-      }
-    }
-
     return { shouldExit: false };
   }
 

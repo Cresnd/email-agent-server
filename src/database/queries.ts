@@ -494,7 +494,9 @@ export class DatabaseQueries {
         .select(`
           compiled_prompt,
           checksum,
+          template_id,
           prompt_template!inner (
+            id,
             type,
             name
           )
@@ -534,7 +536,8 @@ export class DatabaseQueries {
           if (type) {
             venuePrompts[type] = {
               prompt: item.compiled_prompt,
-              checksum: item.checksum
+              checksum: item.checksum,
+              template_id: item.template_id || item.prompt_template.id
             };
           }
         });
@@ -812,13 +815,10 @@ export class DatabaseQueries {
       error_details?: any;
       started_at?: string;
       completed_at?: string;
-      duration_ms?: number;
-      ai_model_used?: string;
       output_confidence_score?: number;
-      tokens_used?: number;
+      output_tokens_consumed?: number;
       output_processing_time_ms?: number;
-      ai_call_time_ms?: number;
-      db_query_time_ms?: number;
+      output_pinned?: boolean;
     }
   ): Promise<void> {
     
@@ -962,8 +962,7 @@ export class DatabaseQueries {
       },
       started_at: result.started_at,
       completed_at: result.completed_at,
-      confidence_score: result.confidence,
-      ai_model_used: result.model
+      output_confidence_score: result.confidence
     }));
 
     const { error } = await this.supabase

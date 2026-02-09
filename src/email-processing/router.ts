@@ -305,6 +305,7 @@ export class EmailProcessor {
         guardrails: promptsAndGuardrails.guardrails || {},
         email_addresses_ignore: venueConfig.filtering_config?.ignored_emails || [],
         domains_ignore: venueConfig.filtering_config?.ignored_domains || [],
+        email_sorting_rules: venueConfig.filtering_config?.sorting_rules || [],
         standard_sorting_rules: {},
         workflows: {},
         database_project_ref: Deno.env.get('SUPABASE_PROJECT_REF') || '',
