@@ -974,6 +974,93 @@ export class DatabaseQueries {
     }
   }
 
+  async upsertDashboardSession(params: {
+    customerEmail: string;
+    venueId: string;
+    firstName?: string;
+    lastName?: string;
+    phoneNumber?: string;
+  }): Promise<{ session_id: string; session_mode: string }> {
+    const email = params.customerEmail.toLowerCase().trim();
+
+    const { data: existing, error: findError } = await this.supabase
+      .from('dashboardsession')
+      .select('id, mode')
+      .eq('customeremail', email)
+      .order('createdat', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (findError && findError.code !== 'PGRST116') {
+      this.logger.warn('Session lookup failed', { error: findError.message });
+    }
+
+    if (existing) {
+      const { data: venueLink } = await this.supabase
+        .from('sessions_to_venue')
+        .select('session_id')
+        .eq('session_id', existing.id)
+        .eq('venue_id', params.venueId)
+        .maybeSingle();
+
+      if (!venueLink) {
+        await this.supabase
+          .from('sessions_to_venue')
+          .insert({ session_id: existing.id, venue_id: params.venueId });
+      }
+
+      const updates: Record<string, any> = {};
+      if (params.phoneNumber) updates.customerphonenumber = params.phoneNumber;
+      if (params.firstName) updates.first_name = params.firstName;
+      if (params.lastName) updates.last_name = params.lastName;
+
+      if (Object.keys(updates).length > 0) {
+        updates.updatedat = new Date().toISOString();
+        await this.supabase
+          .from('dashboardsession')
+          .update(updates)
+          .eq('id', existing.id);
+      }
+
+      return { session_id: existing.id, session_mode: existing.mode || 'automatic' };
+    }
+
+    const newId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    await this.supabase
+      .from('dashboardsession')
+      .insert({
+        id: newId,
+        customeremail: email,
+        mode: 'automatic',
+        first_name: params.firstName || null,
+        last_name: params.lastName || null,
+        customerphonenumber: params.phoneNumber || null,
+        createdat: now,
+        updatedat: now,
+        unread_messages: 0,
+        guest: false
+      });
+
+    await this.supabase
+      .from('sessions_to_venue')
+      .insert({ session_id: newId, venue_id: params.venueId });
+
+    return { session_id: newId, session_mode: 'automatic' };
+  }
+
+  async getSessionMode(sessionId: string): Promise<string | null> {
+    const { data, error } = await this.supabase
+      .from('dashboardsession')
+      .select('mode')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return data.mode || 'automatic';
+  }
+
   /**
    * Test database connection
    */

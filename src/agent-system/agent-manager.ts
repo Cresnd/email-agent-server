@@ -357,6 +357,27 @@ export class AgentManager {
               folder_path: matchedRule?.folder_path,
               mark_as_seen: matchedRule?.mark_as_seen
             };
+          } else if (conditionType === 'manual_mode') {
+            const conditionField = step.condition as string || '';
+            const resolvedCondition = this.variableManager.resolveVariables(
+              { value: conditionField },
+              executionVariables
+            ).value as string;
+
+            let sessionMode: string | null = null;
+            if (resolvedCondition) {
+              sessionMode = await this.db.getSessionMode(resolvedCondition);
+            }
+
+            const isManual = sessionMode === 'manual';
+            conditionPassed = isManual;
+            conditionOutput = {
+              continue: !isManual,
+              condition_type: conditionType,
+              session_id: resolvedCondition,
+              session_mode: sessionMode || 'unknown',
+              is_manual: isManual
+            };
           }
 
           if (workflowExecutionId) {
@@ -446,6 +467,127 @@ export class AgentManager {
           };
         }
 
+        if (step.node_type === 'send') {
+          const startTime = Date.now();
+          processingNotes.push(`Starting Send node "${step.name}"`);
+          
+          if (workflowExecutionId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+              status: 'running',
+              started_at: new Date().toISOString()
+            });
+          }
+
+          try {
+            const from = executionVariables.company_email || '';
+            const to = executionVariables.customer_email || '';
+            const venueId = executionVariables.venue_id || '';
+            const originalSubject = executionVariables.subject || '';
+            const subject = originalSubject.toLowerCase().startsWith('re:') ? originalSubject : `Re: ${originalSubject}`;
+            const inReplyTo = executionVariables.in_reply_to || executionVariables.conversation_id || '';
+            const references = executionVariables.references || '';
+            const outlookId = executionVariables.outlook_id || '';
+            const attachments = executionVariables.attachments || [];
+            const folderPath = executionVariables.standard_sorting_rules?.outgoing_done?.folder_path || 'Sent';
+
+            let bodyHtml = '';
+            const stepOutputs = executionVariables.step || {};
+            const stepKeys = Object.keys(stepOutputs).reverse();
+            for (const key of stepKeys) {
+              const output = stepOutputs[key];
+              if (output?.ai_response?.body_html) {
+                bodyHtml = output.ai_response.body_html;
+                break;
+              }
+            }
+
+            const emailWorkerUrl = Deno.env.get('EMAIL_WORKER_URL') || 'http://localhost:3005';
+            let endpoint: string;
+            let payload: Record<string, any>;
+
+            if (outlookId) {
+              endpoint = `${emailWorkerUrl}/outlook/reply`;
+              payload = { venue_id: venueId, outlook_id: outlookId, from, to, subject, html: bodyHtml, attachments };
+            } else {
+              endpoint = `${emailWorkerUrl}/smtp/send`;
+              payload = { venue_id: venueId, from, to, subject, html: bodyHtml, inReplyTo, references, folder_path: folderPath, attachments };
+            }
+
+            this.logger.info('Send node executing', {
+              endpoint,
+              from,
+              to,
+              subject,
+              has_outlook_id: !!outlookId,
+              body_length: bodyHtml.length
+            });
+
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+
+            const responseData = await response.json();
+            const duration = Date.now() - startTime;
+
+            const sendOutput = {
+              action: 'send_email',
+              protocol: outlookId ? 'outlook' : 'smtp',
+              endpoint,
+              from,
+              to,
+              subject,
+              body_html_length: bodyHtml.length,
+              success: response.ok,
+              response: responseData,
+              duration_ms: duration
+            };
+
+            if (workflowExecutionId) {
+              await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+                status: response.ok ? 'completed' : 'failed',
+                input_data: {
+                  from,
+                  to,
+                  subject,
+                  protocol: outlookId ? 'outlook' : 'smtp',
+                  body_html_preview: bodyHtml.substring(0, 200)
+                },
+                output_data: sendOutput,
+                completed_at: new Date().toISOString(),
+                output_processing_time_ms: duration
+              });
+            }
+
+            registerStepOutput(step.name, sendOutput);
+            processingNotes.push(`Send node "${step.name}" completed in ${duration}ms - ${response.ok ? 'sent' : 'failed'} via ${outlookId ? 'outlook' : 'smtp'}`);
+            this.logger.info('Send node completed', sendOutput);
+          } catch (error) {
+            const duration = Date.now() - startTime;
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            
+            this.logger.error('Send node failed', error);
+            
+            if (workflowExecutionId) {
+              await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+                status: 'failed',
+                error_details: { message: errorMessage },
+                completed_at: new Date().toISOString(),
+                output_processing_time_ms: duration
+              });
+            }
+
+            const failOutput = { action: 'send_email', success: false, error: errorMessage };
+            registerStepOutput(step.name, failOutput);
+            processingNotes.push(`Send node "${step.name}" failed: ${errorMessage}`);
+          }
+
+          const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
+          executionQueue.push(...nextNodes);
+          continue;
+        }
+
         if (step.node_type === 'agent') {
           const nameLower = (step.name || '').toLowerCase();
 
@@ -476,6 +618,28 @@ export class AgentManager {
               guardrail_status: parsingOutput.guardrail_status
             };
             registerStepOutput(step.name, parsingStepOutput);
+
+            if (step.agent_type === 'parsing') {
+              try {
+                const customerEmail = parsingOutput.extraction_result?.email || context.email_content.customer_email;
+                const venueId = context.venue_settings.venue_id;
+                const sessionResult = await this.db.upsertDashboardSession({
+                  customerEmail,
+                  venueId,
+                  firstName: parsingOutput.extraction_result?.first_name || undefined,
+                  lastName: parsingOutput.extraction_result?.last_name || undefined,
+                  phoneNumber: parsingOutput.extraction_result?.phone_number || undefined
+                });
+                executionVariables.session_id = sessionResult.session_id;
+                executionVariables.session_mode = sessionResult.session_mode;
+                parsingStepOutput.session_id = sessionResult.session_id;
+                parsingStepOutput.session_mode = sessionResult.session_mode;
+                this.logger.info('Session upserted after parsing', sessionResult);
+              } catch (error) {
+                this.logger.warn('Session upsert failed', { error: error instanceof Error ? error.message : String(error) });
+              }
+            }
+
             if (workflowExecutionId) {
               try {
                 await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
@@ -509,13 +673,14 @@ export class AgentManager {
               venue_prompts: { orchestrator: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.business_logic || context.venue_prompts.orchestrator },
               guardrails: { post_intent_guardrails: context.guardrails.post_intent_guardrails },
               current_bookings: [],
-              availability_data: null
+              availability_data: null,
+              output_parser: step.output_parser || undefined
             };
             businessLogicOutput = await this.executeWithLogging('business_logic', agentRunId, () => this.businessLogicAgent.process(businessLogicInput));
             businessLogicTime = Date.now() - businessLogicStartTime;
             processingNotes.push(`Business Logic Agent completed in ${businessLogicTime}ms - Decision: ${businessLogicOutput.decision.action_type}`);
             this.logger.info('Business Logic Agent completed', { agent_run_id: agentRunId, action_type: businessLogicOutput.decision.action_type, processing_time_ms: businessLogicTime });
-            const businessLogicStepOutput = {
+            const businessLogicStepOutput: Record<string, any> = {
               action_type: businessLogicOutput.decision.action_type,
               reasoning: businessLogicOutput.decision.reasoning,
               confidence: businessLogicOutput.decision.confidence,
@@ -523,6 +688,9 @@ export class AgentManager {
               refined_extraction: businessLogicOutput.refined_extraction,
               guardrail_status: businessLogicOutput.guardrail_status
             };
+            if ((businessLogicOutput as any)._structured_output) {
+              businessLogicStepOutput.structured_output = (businessLogicOutput as any)._structured_output;
+            }
             registerStepOutput(step.name, businessLogicStepOutput);
             if (workflowExecutionId) {
               try {

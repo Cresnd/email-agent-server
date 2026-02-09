@@ -38,6 +38,7 @@ export interface BusinessLogicAgentInput {
   
   current_bookings?: any[];
   availability_data?: any;
+  output_parser?: Record<string, any>;
 }
 
 export interface BusinessLogicAgentOutput {
@@ -90,7 +91,8 @@ export class BusinessLogicAgent {
       // 3. Call AI with orchestrator prompt to make business decisions
       const orchestratorResult = await this.callOrchestratorAI(
         input.venue_prompts.orchestrator.prompt,
-        aiInput
+        aiInput,
+        input.output_parser
       );
       processingNotes.push(`Orchestrator decision: ${orchestratorResult.decision.action_type}`);
 
@@ -105,7 +107,7 @@ export class BusinessLogicAgent {
       const finalConfidence = this.calculateFinalConfidence(orchestratorResult.decision, guardrailResults);
       processingNotes.push(`Final confidence: ${finalConfidence.toFixed(2)}`);
 
-      return {
+      const result: any = {
         decision: {
           ...orchestratorResult.decision,
           confidence: finalConfidence
@@ -116,6 +118,10 @@ export class BusinessLogicAgent {
         processed_at: new Date().toISOString(),
         processing_notes: processingNotes
       };
+      if (orchestratorResult._structured_output) {
+        result._structured_output = orchestratorResult._structured_output;
+      }
+      return result;
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -164,7 +170,8 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
    */
   private async callOrchestratorAI(
     orchestratorPrompt: string,
-    orchestratorInput: string
+    orchestratorInput: string,
+    outputParser?: Record<string, any>
   ): Promise<{
     decision: {
       action_type: BusinessLogicAgentOutput['decision']['action_type'];
@@ -180,7 +187,11 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
         throw new Error('OpenAI API key not found in environment variables');
       }
 
-      // Make OpenAI API call
+      let systemContent = orchestratorPrompt;
+      if (outputParser) {
+        systemContent += `\n\nIMPORTANT: You MUST respond with a JSON object that follows this exact structure:\n${JSON.stringify(outputParser, null, 2)}\n\nFill in the actual values based on the email data. The "steps" array should contain the execution steps needed for this request. Each step has a "tool" name and "args" object. Only include steps that are relevant to the detected intent/action. If any required fields are missing from the email, list them in "missing_fields".`;
+      }
+
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -192,7 +203,7 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
           messages: [
             {
               role: 'system',
-              content: orchestratorPrompt
+              content: systemContent
             },
             {
               role: 'user',
@@ -224,12 +235,20 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
         throw new Error(`Failed to parse AI response as JSON: ${parseError}`);
       }
 
-      // Validate the response structure and provide defaults
       const decision = {
-        action_type: orchestratorResult.decision?.action_type || 'answer_question',
+        action_type: orchestratorResult.decision?.action_type || orchestratorResult.action || 'answer_question',
         reasoning: orchestratorResult.decision?.reasoning || 'AI decision made',
         requires_human_review: orchestratorResult.decision?.requires_human_review || false
       };
+
+      if (outputParser && orchestratorResult.intent !== undefined) {
+        orchestratorResult._structured_output = {
+          intent: orchestratorResult.intent,
+          action: orchestratorResult.action,
+          missing_fields: orchestratorResult.missing_fields || [],
+          steps: orchestratorResult.steps || []
+        };
+      }
 
       const refined_extraction = {
         first_name: orchestratorResult.refined_extraction?.first_name || '',
@@ -253,10 +272,14 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
         language: orchestratorResult.refined_extraction?.language || 'en'
       };
 
-      return {
+      const returnValue: any = {
         decision,
         refined_extraction
       };
+      if (orchestratorResult._structured_output) {
+        returnValue._structured_output = orchestratorResult._structured_output;
+      }
+      return returnValue;
 
     } catch (error) {
       console.error('Orchestrator AI call failed:', error);
