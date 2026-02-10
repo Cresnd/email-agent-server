@@ -137,17 +137,28 @@ export class WorkflowExecutor {
       await this.emitExecutionEvent(context, 'step_started');
 
       try {
+        // Add the step to history as 'running' first
+        const stepStartTime = new Date();
+        const stepHistoryEntry = {
+          stepId: step.id,
+          status: 'running' as const,
+          startTime: stepStartTime,
+          input: undefined as Record<string, unknown> | undefined,
+          output: undefined as Record<string, unknown> | undefined
+        };
+        context.stepHistory.push(stepHistoryEntry);
+
+        // Emit running event
+        await this.emitExecutionEvent(context, 'step_running');
+
+        // Execute the step
         const stepResult = await this.executeStep(step, context, workflow.settings);
         
-        // Update step history
-        context.stepHistory.push({
-          stepId: step.id,
-          status: 'completed',
-          startTime: new Date(),
-          endTime: new Date(),
-          input: stepResult.input,
-          output: stepResult.output
-        });
+        // Update the same step history entry to completed
+        stepHistoryEntry.status = 'completed';
+        stepHistoryEntry.endTime = new Date();
+        stepHistoryEntry.input = stepResult.input;
+        stepHistoryEntry.output = stepResult.output;
 
         await this.emitExecutionEvent(context, 'step_completed');
 
@@ -155,14 +166,22 @@ export class WorkflowExecutor {
         currentStepId = this.getNextStep(step, stepResult.output, stepMap);
 
       } catch (error) {
-        // Update step history with error
-        context.stepHistory.push({
-          stepId: step.id,
-          status: 'failed',
-          startTime: new Date(),
-          endTime: new Date(),
-          error: error instanceof Error ? error.message : String(error)
-        });
+        // Update the same step history entry to failed
+        const currentStepEntry = context.stepHistory[context.stepHistory.length - 1];
+        if (currentStepEntry && currentStepEntry.stepId === step.id) {
+          currentStepEntry.status = 'failed';
+          currentStepEntry.endTime = new Date();
+          currentStepEntry.error = error instanceof Error ? error.message : String(error);
+        } else {
+          // Fallback: add new entry if not found
+          context.stepHistory.push({
+            stepId: step.id,
+            status: 'failed',
+            startTime: new Date(),
+            endTime: new Date(),
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
 
         await this.emitExecutionEvent(context, 'step_failed');
 
@@ -233,7 +252,7 @@ export class WorkflowExecutor {
   private async emitExecutionEvent(
     context: ExecutionContext,
     eventType: 'workflow_started' | 'workflow_completed' | 'workflow_failed' | 
-              'step_started' | 'step_completed' | 'step_failed'
+              'step_started' | 'step_running' | 'step_completed' | 'step_failed'
   ): Promise<void> {
     // This will be connected to WebSocket broadcasting
     // For now, log the event

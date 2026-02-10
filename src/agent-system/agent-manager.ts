@@ -602,6 +602,19 @@ export class AgentManager {
           if (nameLower.includes('parsing')) {
             processingNotes.push('Starting Parsing Agent');
             const parsingStartTime = Date.now();
+            
+            // Mark step as running
+            if (workflowExecutionId) {
+              try {
+                await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+                  status: 'running',
+                  started_at: new Date().toISOString()
+                });
+              } catch (error) {
+                this.logger.warn('Failed to update workflow step to running for Parsing Agent', { error: error.message || error });
+              }
+            }
+            
             const parsingInput: ParsingAgentInput = {
               email_content: context.email_content,
               venue_prompts: { email_extractor: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.parser || context.venue_prompts.email_extractor },
@@ -667,6 +680,19 @@ export class AgentManager {
             if (!parsingOutput) { this.logger.warn('Business Logic agent reached but no parsing output'); continue; }
             processingNotes.push('Starting Business Logic Agent');
             const businessLogicStartTime = Date.now();
+            
+            // Mark step as running
+            if (workflowExecutionId) {
+              try {
+                await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+                  status: 'running',
+                  started_at: new Date().toISOString()
+                });
+              } catch (error) {
+                this.logger.warn('Failed to update workflow step to running for Business Logic Agent', { error: error.message || error });
+              }
+            }
+            
             const businessLogicInput: BusinessLogicAgentInput = {
               parsing_output: parsingOutput,
               venue_settings: context.venue_settings,
@@ -723,6 +749,19 @@ export class AgentManager {
             if (!parsingOutput || !businessLogicOutput) { this.logger.warn('Action agent reached but missing prior outputs'); continue; }
             processingNotes.push('Starting Action Execution Agent');
             const actionExecutionStartTime = Date.now();
+            
+            // Mark step as running
+            if (workflowExecutionId) {
+              try {
+                await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+                  status: 'running',
+                  started_at: new Date().toISOString()
+                });
+              } catch (error) {
+                this.logger.warn('Failed to update workflow step to running for Action Execution Agent', { error: error.message || error });
+              }
+            }
+            
             const actionExecutionInput: ActionExecutionAgentInput = {
               business_logic_output: businessLogicOutput,
               original_email: context.email_content,

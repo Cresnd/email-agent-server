@@ -728,6 +728,7 @@ export class DatabaseQueries {
    */
   async createWorkflowExecutionSteps(executionId: string, templateId: string, triggerData?: any, pinnedSteps?: Array<{id: string, step_name: string, node_id?: string, output_data: any, step_order: number}>, triggerOutputData?: Record<string, any>): Promise<void> {
     const nodes = await this.getWorkflowNodes(templateId);
+    const connections = await this.getWorkflowConnections(templateId);
     
     // Get the workflow execution trigger data if not provided
     if (!triggerData) {
@@ -739,6 +740,9 @@ export class DatabaseQueries {
       triggerData = execution?.trigger_data;
     }
     
+    // Analyze workflow graph to determine which nodes are only reachable via negative paths
+    const negativeOnlyNodes = this.findNegativeOnlyNodes(nodes, connections);
+    
     // Create steps for nodes only - tools will be added when executed
     const nodeSteps = nodes.map((node, index) => {
       const stepOrder = index + 1;
@@ -746,13 +750,20 @@ export class DatabaseQueries {
       // Check if this step has pinned data
       const pinnedStep = pinnedSteps?.find(ps => ps.node_id === node.id || ps.step_name === node.name || ps.step_order === stepOrder);
       
+      // Determine initial status based on workflow graph analysis
+      let initialStatus = 'pending';
+      if (negativeOnlyNodes.has(node.id)) {
+        // This node is only reachable via negative paths (guardrail failures, error scenarios)
+        initialStatus = 'skipped';
+      }
+      
       const step: any = {
         execution_id: executionId,
         step_order: stepOrder,
         step_type: node.node_type,
         step_name: node.name,
         node_id: node.id,
-        status: 'pending'
+        status: initialStatus
       };
 
       // Handle trigger step:
@@ -1059,6 +1070,60 @@ export class DatabaseQueries {
 
     if (error || !data) return null;
     return data.mode || 'automatic';
+  }
+
+  /**
+   * Analyze workflow graph to find nodes that should be initially skipped
+   * This includes all nodes that come after guardrails (both positive and negative paths)
+   * since we don't know which path will be taken until the guardrail executes
+   */
+  private findNegativeOnlyNodes(nodes: any[], connections: any[]): Set<string> {
+    const nodesToSkip = new Set<string>();
+    
+    // Find all guardrail nodes
+    const guardrailNodes = nodes.filter(node => node.node_type === 'guardrail');
+    
+    // Find all nodes that come after guardrails (both positive and negative outputs)
+    for (const guardrail of guardrailNodes) {
+      const outgoingConnections = connections.filter(conn => conn.source_node_id === guardrail.id);
+      
+      for (const conn of outgoingConnections) {
+        // Mark all nodes reachable from guardrails as initially skipped
+        this.markNodeAndDescendants(conn.target_node_id, nodes, connections, nodesToSkip);
+      }
+    }
+    
+    // Also mark obviously unreachable nodes
+    for (const node of nodes) {
+      // Skip trigger nodes as they are the starting point
+      if (node.node_type === 'trigger') continue;
+      
+      // Find all connections that target this node
+      const incomingConnections = connections.filter(conn => conn.target_node_id === node.id);
+      
+      if (incomingConnections.length === 0) {
+        // Unreachable nodes should be skipped
+        nodesToSkip.add(node.id);
+      }
+    }
+    
+    return nodesToSkip;
+  }
+
+  /**
+   * Recursively mark a node and all its descendants as skipped
+   */
+  private markNodeAndDescendants(nodeId: string, nodes: any[], connections: any[], nodesToSkip: Set<string>): void {
+    if (nodesToSkip.has(nodeId)) return; // Already processed
+    
+    nodesToSkip.add(nodeId);
+    
+    // Find all outgoing connections from this node
+    const outgoingConnections = connections.filter(conn => conn.source_node_id === nodeId);
+    
+    for (const conn of outgoingConnections) {
+      this.markNodeAndDescendants(conn.target_node_id, nodes, connections, nodesToSkip);
+    }
   }
 
   /**
