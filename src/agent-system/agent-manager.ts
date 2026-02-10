@@ -261,6 +261,23 @@ export class AgentManager {
       }
 
       while (executionQueue.length > 0) {
+        // Check if execution has been cancelled
+        if (workflowExecutionId) {
+          const { data: execution } = await this.db.supabase
+            .from('workflow_executions')
+            .select('status')
+            .eq('id', workflowExecutionId)
+            .single();
+          
+          if (execution?.status === 'cancelled') {
+            this.logger.info('⛔ Execution cancelled - stopping pipeline', { 
+              workflowExecutionId,
+              remaining_steps: executionQueue.length
+            });
+            break;
+          }
+        }
+
         const step = executionQueue.shift()!;
         if (executedNodes.has(step.id)) continue;
         executedNodes.add(step.id);
@@ -697,7 +714,8 @@ export class AgentManager {
               guardrails: { post_intent_guardrails: context.guardrails.post_intent_guardrails },
               current_bookings: [],
               availability_data: null,
-              output_parser: step.output_parser || undefined
+              output_parser: step.output_parser || undefined,
+              resolved_prompt: resolvedAgentPrompt // Pass the resolved prompt from workflow variables
             };
             businessLogicOutput = await this.executeWithLogging('business_logic', agentRunId, () => this.businessLogicAgent.process(businessLogicInput));
             businessLogicTime = Date.now() - businessLogicStartTime;

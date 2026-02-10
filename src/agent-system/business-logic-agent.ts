@@ -40,6 +40,7 @@ export interface BusinessLogicAgentInput {
   current_bookings?: any[];
   availability_data?: any;
   output_parser?: Record<string, any>;
+  resolved_prompt?: string; // The resolved prompt from workflow variables (e.g. resolved {{ step.parsing }})
 }
 
 export interface BusinessLogicAgentOutput {
@@ -94,8 +95,15 @@ export class BusinessLogicAgent {
       processingNotes.push(`Using orchestrator prompt (checksum: ${input.venue_prompts.orchestrator.checksum})`);
 
       // 2. Prepare AI input with parsing results and venue context
-      const aiInput = this.prepareOrchestratorInput(input);
-      processingNotes.push(`Prepared orchestrator input for action: ${input.parsing_output.extraction_result.action}`);
+      // Use the resolved prompt if available (from workflow variables), otherwise prepare the default format
+      let aiInput: string;
+      if (input.resolved_prompt) {
+        aiInput = input.resolved_prompt;
+        processingNotes.push(`Using resolved prompt from workflow variables`);
+      } else {
+        aiInput = this.prepareOrchestratorInput(input);
+        processingNotes.push(`Prepared orchestrator input for action: ${input.parsing_output.extraction_result.action}`);
+      }
 
       // 3. Call AI with orchestrator prompt to make business decisions
       const orchestratorResult = await this.callOrchestratorAI(

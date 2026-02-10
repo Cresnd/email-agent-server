@@ -110,6 +110,11 @@ export class EmailProcessor {
     this.router.get('/status/:agent_run_id', async (ctx) => {
       await this.handleStatusCheck(ctx);
     });
+
+    // Cancel execution endpoint
+    this.router.post('/cancel/:workflow_execution_id', async (ctx) => {
+      await this.handleExecutionCancel(ctx);
+    });
   }
 
   /**
@@ -378,23 +383,29 @@ export class EmailProcessor {
       // Check if this is a rerun (has execution_id from edge function)
       let workflowExecutionId: string;
       let isRerun = false;
+      let parentExecutionId: string | null = null;
       
       if (emailPayload.execution_id && emailPayload.parent_execution_id) {
-        // This is a rerun from the edge function - use the provided execution ID
+        // This is a rerun from the edge function with explicit parent - use the provided execution ID
         workflowExecutionId = emailPayload.execution_id;
+        parentExecutionId = emailPayload.parent_execution_id;
         isRerun = true;
-        this.logger.info('Using existing execution ID from rerun', { 
+        this.logger.info('Using existing execution ID from rerun with explicit parent', { 
           workflowExecutionId,
-          parent_execution_id: emailPayload.parent_execution_id
+          parent_execution_id: parentExecutionId
         });
-      } else if (emailPayload.execution_id) {
-        // Execution ID provided but no parent - use it as-is
-        workflowExecutionId = emailPayload.execution_id;
-        this.logger.info('Using provided execution ID', { 
-          workflowExecutionId
+      } else if (emailPayload.execution_id && !emailPayload.parent_execution_id) {
+        // Execution ID provided but no parent - this is a rerun where execution_id IS the parent
+        // Generate a new execution ID for the rerun
+        parentExecutionId = emailPayload.execution_id;
+        workflowExecutionId = crypto.randomUUID();
+        isRerun = false; // We'll create a new execution with parent reference
+        this.logger.info('Creating rerun execution with parent', { 
+          workflowExecutionId,
+          parent_execution_id: parentExecutionId
         });
       } else {
-        // Create new workflow execution record
+        // Create new workflow execution record (no parent)
         workflowExecutionId = crypto.randomUUID();
         this.logger.info('Creating new workflow execution record', { 
           workflowExecutionId,
@@ -412,7 +423,7 @@ export class EmailProcessor {
             workflow_id: venueWorkflowId, // Dynamic workflow based on venue configuration
             organization_id: venueConfig.venue_settings.organization_id,
             venue_id: emailPayload.venue_id,
-            parent_execution: emailPayload.parent_execution_id || null,
+            parent_execution: parentExecutionId, // Use the parentExecutionId variable we set above
             started_at: new Date().toISOString(),
             customer_email: emailPayload.from,
             subject: emailPayload.subject,
@@ -591,6 +602,110 @@ export class EmailProcessor {
     } catch (error) {
       this.logger.error('Email operations failed', error);
       throw error;
+    }
+  }
+
+  /**
+   * Handle execution cancellation
+   */
+  private async handleExecutionCancel(ctx: any): Promise<void> {
+    const startTime = Date.now();
+    const requestId = crypto.randomUUID();
+    
+    try {
+      const workflowExecutionId = ctx.params.workflow_execution_id;
+      
+      if (!workflowExecutionId) {
+        ctx.response.status = 400;
+        ctx.response.body = {
+          success: false,
+          error: 'Missing workflow_execution_id parameter',
+          request_id: requestId
+        };
+        return;
+      }
+
+      // Validate UUID format
+      if (!this.isValidUUID(workflowExecutionId)) {
+        ctx.response.status = 400;
+        ctx.response.body = {
+          success: false,
+          error: 'Invalid workflow execution ID format',
+          request_id: requestId
+        };
+        return;
+      }
+
+      this.logger.info('Received execution cancel request', {
+        request_id: requestId,
+        workflow_execution_id: workflowExecutionId
+      });
+
+      // Update workflow execution status to 'cancelled'
+      try {
+        await this.db.updateWorkflowExecution(workflowExecutionId, {
+          status: 'cancelled',
+          finished_at: new Date().toISOString(),
+          duration_ms: Date.now() - startTime
+        });
+
+        // Also cancel any running steps
+        const { data: steps } = await this.db.supabase
+          .from('workflow_execution_steps')
+          .select('*')
+          .eq('execution_id', workflowExecutionId)
+          .eq('status', 'running');
+
+        if (steps && steps.length > 0) {
+          for (const step of steps) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.node_id, {
+              status: 'cancelled',
+              finished_at: new Date().toISOString()
+            });
+          }
+        }
+
+        this.logger.info('Execution cancelled successfully', {
+          request_id: requestId,
+          workflow_execution_id: workflowExecutionId,
+          cancelled_steps: steps?.length || 0
+        });
+
+        ctx.response.body = {
+          success: true,
+          message: 'Execution cancelled successfully',
+          workflow_execution_id: workflowExecutionId,
+          cancelled_steps: steps?.length || 0,
+          request_id: requestId
+        };
+
+      } catch (dbError) {
+        this.logger.error('Database error during cancellation', {
+          request_id: requestId,
+          workflow_execution_id: workflowExecutionId,
+          error: dbError.message || dbError
+        });
+
+        ctx.response.status = 500;
+        ctx.response.body = {
+          success: false,
+          error: 'Failed to cancel execution',
+          request_id: requestId
+        };
+      }
+
+    } catch (error) {
+      this.logger.error('Execution cancel request failed', {
+        request_id: requestId,
+        error: error.message || error
+      });
+
+      ctx.response.status = 500;
+      ctx.response.body = {
+        success: false,
+        error: 'Internal server error',
+        request_id: requestId
+      };
     }
   }
 
