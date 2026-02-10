@@ -392,6 +392,23 @@ export class AgentManager {
 
           const handle = conditionPassed ? 'negative_node_output' : 'positive_node_output';
           const nextNodes = this.getNextNodes(step.id, handle, workflowConnections, nodeMap);
+          
+          // Extra detailed logging for manual_mode condition
+          if (step.name === 'manual_mode' || conditionType === 'manual_mode') {
+            this.logger.info('🔍 MANUAL_MODE CONDITION DETAILED ROUTING', {
+              node_name: step.name,
+              condition_type: conditionType,
+              session_mode: conditionOutput.session_mode,
+              isManual: conditionPassed,
+              continue_value: conditionOutput.continue,
+              routing_handle: handle,
+              next_nodes_count: nextNodes.length,
+              next_nodes: nextNodes.map((n: any) => ({ id: n.id, name: n.name, type: n.node_type })),
+              step_id: step.id,
+              execution_queue_after: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
+            });
+          }
+          
           this.logger.info('Condition routing', {
             node: step.name,
             condition_type: conditionType,
@@ -441,30 +458,10 @@ export class AgentManager {
           processingNotes.push(`Move node executed: folder=${folderPath}, mark_as_seen=${markAsSeen}`);
           this.logger.info('Move node executed', moveOutput);
 
-          // Pipeline ends here — build a result with the move operation
-          const totalExecutionTime = Date.now() - startTime;
-          return {
-            success: true,
-            agent_run_id: agentRunId,
-            total_execution_time_ms: totalExecutionTime,
-            agent_execution_times: { parsing_agent_ms: 0, business_logic_agent_ms: 0, action_execution_agent_ms: 0 },
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            processing_notes: processingNotes,
-            action_execution_output: {
-              final_status: lastConditionMatch ? 'email_sorted' : 'guardrail_violation',
-              ai_response: null,
-              email_operations: {
-                send_response: false,
-                move_to_folder: folderPath,
-                mark_as_seen: markAsSeen,
-                create_draft: false
-              },
-              tool_executions: [],
-              guardrail_status: lastConditionMatch ? 'sorted' : 'violated',
-              guardrail_violations: lastConditionMatch ? [] : [lastGuardrailOutput?.violation || {}]
-            } as any
-          };
+          // Continue to next nodes after move operation
+          const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
+          executionQueue.push(...nextNodes);
+          continue;
         }
 
         if (step.node_type === 'send') {
@@ -822,7 +819,61 @@ export class AgentManager {
           executionQueue.push(...nextNodes);
           continue;
         }
+
+        // Handle exit nodes
+        if (step.node_type === 'exit') {
+          this.logger.info('🚪 EXIT NODE EXECUTION', {
+            node_name: step.name,
+            node_id: step.id,
+            execution_queue_remaining: executionQueue.length
+          });
+          
+          if (workflowExecutionId) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
+              status: 'completed',
+              started_at: new Date().toISOString(),
+              completed_at: new Date().toISOString()
+            });
+          }
+          
+          processingNotes.push(`Exit node "${step.name}" executed - workflow completed successfully`);
+          
+          // Exit nodes typically end the workflow, but we can also check for next nodes
+          const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
+          if (nextNodes.length > 0) {
+            this.logger.info('Exit node has next nodes, continuing execution', { 
+              next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
+            });
+            executionQueue.push(...nextNodes);
+          } else {
+            this.logger.info('Exit node completed - no further nodes to execute');
+          }
+          continue;
+        }
+
+        // Catch-all for unhandled node types
+        this.logger.warn('⚠️ UNHANDLED NODE TYPE', {
+          node_type: step.node_type,
+          node_name: step.name,
+          node_id: step.id
+        });
+        
+        // Still try to find next nodes for unhandled types
+        const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
+        if (nextNodes.length > 0) {
+          this.logger.info('Adding next nodes from unhandled node type', { 
+            next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
+          });
+          executionQueue.push(...nextNodes);
+        }
+        continue;
       }
+
+      // Log when execution queue becomes empty
+      this.logger.info('📋 EXECUTION QUEUE EMPTY - Workflow execution completed', {
+        total_steps_executed: orderedSteps.length,
+        processing_notes_count: processingNotes.length
+      });
 
       // Fallback: if no workflow graph was loaded, run the default 3-agent pipeline
       if (orderedSteps.length === 0) {
@@ -898,7 +949,7 @@ export class AgentManager {
       this.logger.info('Agent pipeline completed successfully', {
         agent_run_id: agentRunId,
         total_time_ms: totalExecutionTime,
-        final_status: actionExecutionOutput.final_status
+        final_status: actionExecutionOutput?.final_status || 'completed_without_action'
       });
 
       return result;
