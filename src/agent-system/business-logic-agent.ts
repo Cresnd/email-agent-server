@@ -4,6 +4,7 @@
  */
 
 import { ParsingAgentOutput } from './parsing-agent.ts';
+import { StructuredOutputParser, StructuredOutput } from './structured-output-parser.ts';
 
 export interface BusinessLogicAgentInput {
   parsing_output: ParsingAgentOutput;
@@ -64,9 +65,17 @@ export interface BusinessLogicAgentOutput {
   // Processing metadata
   processed_at: string;
   processing_notes: string[];
+
+  // New structured output format
+  structured_output?: StructuredOutput;
 }
 
 export class BusinessLogicAgent {
+  private structuredOutputParser: StructuredOutputParser;
+
+  constructor() {
+    this.structuredOutputParser = StructuredOutputParser.createDefault();
+  }
   
   /**
    * Main processing method for Business Logic Agent
@@ -107,7 +116,8 @@ export class BusinessLogicAgent {
       const finalConfidence = this.calculateFinalConfidence(orchestratorResult.decision, guardrailResults);
       processingNotes.push(`Final confidence: ${finalConfidence.toFixed(2)}`);
 
-      const result: any = {
+      // Create the base result
+      const baseResult: any = {
         decision: {
           ...orchestratorResult.decision,
           confidence: finalConfidence
@@ -118,9 +128,16 @@ export class BusinessLogicAgent {
         processed_at: new Date().toISOString(),
         processing_notes: processingNotes
       };
-      if (orchestratorResult._structured_output) {
-        result._structured_output = orchestratorResult._structured_output;
-      }
+
+      // Apply structured output parsing
+      const structuredOutput = await this.structuredOutputParser.parse(baseResult);
+      processingNotes.push('Applied structured output parsing');
+
+      const result: BusinessLogicAgentOutput = {
+        ...baseResult,
+        structured_output: structuredOutput
+      };
+
       return result;
 
     } catch (error) {
@@ -128,7 +145,7 @@ export class BusinessLogicAgent {
       processingNotes.push(`Error during orchestration: ${errorMessage}`);
 
       // Return fallback result
-      return this.createFallbackResult(input.parsing_output, processingNotes, errorMessage);
+      return await this.createFallbackResult(input.parsing_output, processingNotes, errorMessage);
     }
   }
 
@@ -190,6 +207,9 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
       let systemContent = orchestratorPrompt;
       if (outputParser) {
         systemContent += `\n\nIMPORTANT: You MUST respond with a JSON object that follows this exact structure:\n${JSON.stringify(outputParser, null, 2)}\n\nFill in the actual values based on the email data. The "steps" array should contain the execution steps needed for this request. Each step has a "tool" name and "args" object. Only include steps that are relevant to the detected intent/action. If any required fields are missing from the email, list them in "missing_fields".`;
+      } else {
+        // Use the structured output parser's schema when no output parser is provided
+        systemContent += `\n\nIMPORTANT: You MUST respond with a JSON object that follows this exact structure:\n${this.structuredOutputParser.getSchemaExample()}\n\nFill in the actual values based on the email data. The "steps" array should contain the execution steps needed for this request. Each step has a "tool" name and "args" object. Only include steps that are relevant to the detected intent/action. If any required fields are missing from the email, list them in "missing_fields".`;
       }
 
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -241,7 +261,8 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
         requires_human_review: orchestratorResult.decision?.requires_human_review || false
       };
 
-      if (outputParser && orchestratorResult.intent !== undefined) {
+      // Check if the result contains the new structured output format
+      if (orchestratorResult.intent !== undefined && orchestratorResult.action !== undefined) {
         orchestratorResult._structured_output = {
           intent: orchestratorResult.intent,
           action: orchestratorResult.action,
@@ -395,12 +416,12 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
   /**
    * Create fallback result for error cases
    */
-  private createFallbackResult(
+  private async createFallbackResult(
     parsingOutput: ParsingAgentOutput,
     processingNotes: string[],
     errorMessage: string
-  ): BusinessLogicAgentOutput {
-    return {
+  ): Promise<BusinessLogicAgentOutput> {
+    const baseResult = {
       decision: {
         action_type: 'escalate',
         reasoning: `Orchestrator processing failed: ${errorMessage}`,
@@ -408,15 +429,23 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
         requires_human_review: true
       },
       refined_extraction: parsingOutput.extraction_result,
-      guardrail_status: 'flagged',
+      guardrail_status: 'flagged' as const,
       guardrail_violations: [{
         guardrail_name: 'orchestrator_error',
-        violation_type: 'flagged',
+        violation_type: 'flagged' as const,
         confidence: 1.0,
         reasoning: errorMessage
       }],
       processed_at: new Date().toISOString(),
       processing_notes: processingNotes
+    };
+
+    // Apply structured output parsing even for error cases
+    const structuredOutput = await this.structuredOutputParser.parse(baseResult);
+
+    return {
+      ...baseResult,
+      structured_output: structuredOutput
     };
   }
 }

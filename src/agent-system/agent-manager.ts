@@ -680,16 +680,23 @@ export class AgentManager {
             businessLogicTime = Date.now() - businessLogicStartTime;
             processingNotes.push(`Business Logic Agent completed in ${businessLogicTime}ms - Decision: ${businessLogicOutput.decision.action_type}`);
             this.logger.info('Business Logic Agent completed', { agent_run_id: agentRunId, action_type: businessLogicOutput.decision.action_type, processing_time_ms: businessLogicTime });
-            const businessLogicStepOutput: Record<string, any> = {
-              action_type: businessLogicOutput.decision.action_type,
-              reasoning: businessLogicOutput.decision.reasoning,
-              confidence: businessLogicOutput.decision.confidence,
-              requires_human_review: businessLogicOutput.decision.requires_human_review,
-              refined_extraction: businessLogicOutput.refined_extraction,
-              guardrail_status: businessLogicOutput.guardrail_status
-            };
-            if ((businessLogicOutput as any)._structured_output) {
-              businessLogicStepOutput.structured_output = (businessLogicOutput as any)._structured_output;
+            
+            // Use the new structured output format as the main output for business logic agents
+            let businessLogicStepOutput: Record<string, any>;
+            if (businessLogicOutput.structured_output) {
+              // Replace the entire business logic output with the structured format
+              businessLogicStepOutput = businessLogicOutput.structured_output;
+              processingNotes.push(`Using structured output format - Intent: ${businessLogicOutput.structured_output.intent}, Action: ${businessLogicOutput.structured_output.action}`);
+            } else {
+              // Fallback to legacy format if structured output is not available
+              businessLogicStepOutput = {
+                action_type: businessLogicOutput.decision.action_type,
+                reasoning: businessLogicOutput.decision.reasoning,
+                confidence: businessLogicOutput.decision.confidence,
+                requires_human_review: businessLogicOutput.decision.requires_human_review,
+                refined_extraction: businessLogicOutput.refined_extraction,
+                guardrail_status: businessLogicOutput.guardrail_status
+              };
             }
             registerStepOutput(step.name, businessLogicStepOutput);
             if (workflowExecutionId) {
@@ -800,6 +807,11 @@ export class AgentManager {
         const blStart = Date.now();
         businessLogicOutput = await this.executeWithLogging('business_logic', agentRunId, () => this.businessLogicAgent.process(businessLogicInput));
         businessLogicTime = Date.now() - blStart;
+        
+        // Use structured output format for fallback execution as well
+        if (businessLogicOutput?.structured_output) {
+          processingNotes.push(`Fallback pipeline using structured output format`);
+        }
 
         const actionExecutionInput: ActionExecutionAgentInput = {
           business_logic_output: businessLogicOutput,
@@ -818,11 +830,17 @@ export class AgentManager {
 
       const totalExecutionTime = Date.now() - startTime;
       
+      // Create the result with structured output format for business logic if available
+      let finalBusinessLogicOutput: any = businessLogicOutput;
+      if (businessLogicOutput?.structured_output) {
+        finalBusinessLogicOutput = businessLogicOutput.structured_output;
+      }
+
       const result: AgentPipelineResult = {
         success: true,
         agent_run_id: agentRunId,
         parsing_output: parsingOutput,
-        business_logic_output: businessLogicOutput,
+        business_logic_output: finalBusinessLogicOutput,
         action_execution_output: actionExecutionOutput,
         total_execution_time_ms: totalExecutionTime,
         agent_execution_times: {

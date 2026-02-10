@@ -180,15 +180,33 @@ export class VariableManager {
       const variableName = (dollarVar || braceVar).trim();
       const value = this.resolveVariablePath(variables, variableName);
       
+      console.log(`[VariableManager] Resolving variable: ${variableName}`);
+      
+      if (variableName === 'step.parsing_agent') {
+        console.log(`[VariableManager] *** STEP.PARSING_AGENT FOUND ***`);
+        console.log(`[VariableManager] Type:`, typeof value);
+        console.log(`[VariableManager] Is object:`, typeof value === 'object' && value !== null);
+        console.log(`[VariableManager] Keys:`, typeof value === 'object' && value !== null ? Object.keys(value) : 'N/A');
+        console.log(`[VariableManager] Value preview:`, JSON.stringify(value)?.substring(0, 500) + '...');
+      } else {
+        console.log(`[VariableManager] Variable value:`, JSON.stringify(value, null, 2));
+        console.log(`[VariableManager] Available variables:`, Object.keys(variables));
+      }
+      
       if (value === undefined || value === null) {
+        console.log(`[VariableManager] Variable '${variableName}' not found, keeping original: ${match}`);
         return match; // Keep original if variable not found
       }
 
       if (typeof value === 'object') {
-        return JSON.stringify(value);
+        const result = JSON.stringify(value);
+        console.log(`[VariableManager] Serialized object to JSON:`, result.substring(0, 200) + '...');
+        return result;
       }
       
-      return String(value);
+      const result = String(value);
+      console.log(`[VariableManager] Resolved to string:`, result.substring(0, 200) + '...');
+      return result;
     });
   }
 
