@@ -256,7 +256,7 @@ export class AgentManager {
       const triggerNode = workflowNodes.find(n => n.node_type === 'trigger');
       if (triggerNode) {
         const nextNodes = this.getNextNodes(triggerNode.id, 'node_output', workflowConnections, nodeMap);
-        executionQueue.push(...nextNodes);
+        await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
         executedNodes.add(triggerNode.id);
       }
 
@@ -323,7 +323,7 @@ export class AgentManager {
             handle,
             next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
           });
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           continue;
         }
 
@@ -417,7 +417,7 @@ export class AgentManager {
             next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
           });
           processingNotes.push(`Condition node "${step.name}" (${conditionType}) evaluated - ${conditionPassed ? 'matched' : 'no match'}`);
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           continue;
         }
 
@@ -460,7 +460,7 @@ export class AgentManager {
 
           // Continue to next nodes after move operation
           const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           continue;
         }
 
@@ -581,7 +581,7 @@ export class AgentManager {
           }
 
           const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           continue;
         }
 
@@ -816,7 +816,7 @@ export class AgentManager {
           }
 
           const nextNodes = this.getNextNodes(step.id, 'node_output', workflowConnections, nodeMap);
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           continue;
         }
 
@@ -844,7 +844,7 @@ export class AgentManager {
             this.logger.info('Exit node has next nodes, continuing execution', { 
               next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
             });
-            executionQueue.push(...nextNodes);
+            await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
           } else {
             this.logger.info('Exit node completed - no further nodes to execute');
           }
@@ -864,7 +864,7 @@ export class AgentManager {
           this.logger.info('Adding next nodes from unhandled node type', { 
             next_nodes: nextNodes.map((n: any) => `${n.node_type}:${n.name}`)
           });
-          executionQueue.push(...nextNodes);
+          await this.queueNodesForExecution(nextNodes, executionQueue, workflowExecutionId);
         }
         continue;
       }
@@ -1131,6 +1131,37 @@ export class AgentManager {
       }
     }
     return null;
+  }
+
+  /**
+   * Queue next nodes for execution and update their status to pending in the database
+   */
+  private async queueNodesForExecution(
+    nextNodes: any[], 
+    executionQueue: any[], 
+    workflowExecutionId: string | null
+  ) {
+    if (nextNodes.length === 0) return;
+    
+    // Add nodes to execution queue
+    executionQueue.push(...nextNodes);
+    
+    // Update database status to 'pending' for queued nodes
+    if (workflowExecutionId) {
+      for (const node of nextNodes) {
+        try {
+          await this.db.updateWorkflowExecutionStep(workflowExecutionId, node.id, {
+            status: 'pending'
+          });
+        } catch (error) {
+          this.logger.warn('Failed to update step status to pending', { 
+            nodeId: node.id, 
+            nodeName: node.name, 
+            error: error.message 
+          });
+        }
+      }
+    }
   }
 
   private findLastGuardrailViolation(stepOutputs: Record<string, any>): any | null {

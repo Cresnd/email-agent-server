@@ -1074,8 +1074,8 @@ export class DatabaseQueries {
 
   /**
    * Analyze workflow graph to find nodes that should be initially skipped
-   * This includes all nodes that come after guardrails (both positive and negative paths)
-   * since we don't know which path will be taken until the guardrail executes
+   * This includes all nodes that come after guardrails and condition nodes (both positive and negative paths)
+   * since we don't know which path will be taken until the node executes
    */
   private findNegativeOnlyNodes(nodes: any[], connections: any[]): Set<string> {
     const nodesToSkip = new Set<string>();
@@ -1089,6 +1089,19 @@ export class DatabaseQueries {
       
       for (const conn of outgoingConnections) {
         // Mark all nodes reachable from guardrails as initially skipped
+        this.markNodeAndDescendants(conn.target_node_id, nodes, connections, nodesToSkip);
+      }
+    }
+    
+    // Find all condition nodes and mark nodes on BOTH paths as initially skipped
+    const conditionNodes = nodes.filter(node => node.node_type === 'condition');
+    
+    for (const condition of conditionNodes) {
+      const outgoingConnections = connections.filter(conn => conn.source_node_id === condition.id);
+      
+      for (const conn of outgoingConnections) {
+        // Mark all nodes reachable from condition nodes as initially skipped
+        // They will only be marked as pending when actually queued for execution
         this.markNodeAndDescendants(conn.target_node_id, nodes, connections, nodesToSkip);
       }
     }
