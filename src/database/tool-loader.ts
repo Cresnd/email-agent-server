@@ -89,9 +89,20 @@ export class ToolLoader {
     try {
       this.logger.debug(`Executing tool: ${tool.tool_name}`, { tool_type: tool.tool_type });
 
+      // Build enriched context with step outputs if workflowExecutionId is provided
+      let enrichedContext = { ...context, ...parameters };
+      if (workflowExecutionId) {
+        const stepContext = await this.buildStepContext(workflowExecutionId);
+        enrichedContext = { ...enrichedContext, ...stepContext };
+        this.logger.debug('Built step context for tool execution', { 
+          tool_name: tool.tool_name,
+          step_keys: Object.keys(stepContext)
+        });
+      }
+
       // Step 1: Create tool step as 'pending' if workflowExecutionId provided
       if (workflowExecutionId) {
-        toolStepId = await this.createPendingToolStep(workflowExecutionId, tool, { ...parameters, ...context });
+        toolStepId = await this.createPendingToolStep(workflowExecutionId, tool, enrichedContext);
       }
 
       // Step 2: Update to 'running' before execution starts
@@ -102,17 +113,17 @@ export class ToolLoader {
       let result: ToolExecutionResult;
       switch (tool.tool_type) {
         case 'http_request':
-          result = await this.executeHttpTool(tool, parameters, context);
+          result = await this.executeHttpTool(tool, parameters, enrichedContext);
           break;
         case 'postgres':
         case 'postgresTool':
-          result = await this.executePostgresTool(tool, parameters, context);
+          result = await this.executePostgresTool(tool, parameters, enrichedContext);
           break;
         case 'edge_function':
-          result = await this.executeEdgeFunctionTool(tool, parameters, context);
+          result = await this.executeEdgeFunctionTool(tool, parameters, enrichedContext);
           break;
         case 'workflow':
-          result = await this.executeWorkflowTool(tool, parameters, context);
+          result = await this.executeWorkflowTool(tool, parameters, enrichedContext);
           break;
         default:
           throw new Error(`Tool type ${tool.tool_type} not supported yet`);
@@ -162,9 +173,46 @@ export class ToolLoader {
       database_project_ref: 'qaymciaujneyqhsbycmp' // Add the project ref
     };
 
-    // Replace template variables in URL, headers, and body
+    this.logger.info(`Preparing to execute HTTP tool: ${tool.tool_name}`, {
+      original_body: tool.tool_body,
+      context_keys: Object.keys(enrichedContext).slice(0, 20),
+      has_step_context: !!enrichedContext['step.business_logic'],
+      business_logic_keys: enrichedContext['step.business_logic'] ? Object.keys(enrichedContext['step.business_logic']).slice(0, 10) : []
+    });
+
+    // Replace template variables in URL
     let url = this.replaceTemplateVars(tool.url!, enrichedContext);
-    let body = this.replaceTemplateVars(JSON.stringify(tool.tool_body || {}), enrichedContext);
+    
+    // Handle tool body - it might be a JSON string with template variables
+    let body: string;
+    
+    if (tool.tool_body) {
+      // If tool_body is already a string, use it directly
+      let bodyStr = typeof tool.tool_body === 'string' ? tool.tool_body : JSON.stringify(tool.tool_body);
+      
+      // Replace template variables in the body string
+      bodyStr = this.replaceTemplateVars(bodyStr, enrichedContext);
+      
+      // Try to parse and re-stringify to ensure valid JSON
+      try {
+        const parsedBody = JSON.parse(bodyStr);
+        body = JSON.stringify(parsedBody);
+      } catch (e) {
+        this.logger.error(`Failed to create valid JSON body after template replacement: ${e.message}`, { 
+          tool_name: tool.tool_name,
+          body_after_replacement: bodyStr 
+        });
+        body = '{}'; // Use empty object if we can't parse it
+      }
+    } else {
+      body = '{}';
+    }
+    
+    this.logger.info(`Template variables replaced for tool: ${tool.tool_name}`, {
+      original_body: JSON.stringify(tool.tool_body),
+      replaced_body: body,
+      url: url
+    });
     
     // Process headers with template variables
     const headers: Record<string, string> = {
@@ -180,7 +228,8 @@ export class ToolLoader {
     this.logger.debug(`Executing HTTP tool: ${tool.tool_name}`, {
       url,
       method: tool.method || 'POST',
-      headers: { ...headers, Authorization: headers.Authorization ? '[REDACTED]' : undefined }
+      headers: { ...headers, Authorization: headers.Authorization ? '[REDACTED]' : undefined },
+      body_length: body.length
     });
 
     const response = await fetch(url, {
@@ -254,9 +303,35 @@ export class ToolLoader {
       database_project_ref: 'qaymciaujneyqhsbycmp'
     };
 
-    // Replace template variables in URL and body
+    // Replace template variables in URL
+    this.logger.debug(`URL before replacement: ${tool.url}`);
     let url = this.replaceTemplateVars(tool.url!, enrichedContext);
-    let body = this.replaceTemplateVars(JSON.stringify(tool.tool_body || {}), enrichedContext);
+    this.logger.debug(`URL after replacement: ${url}`);
+    
+    // Handle tool body - it might be a JSON string with template variables
+    let body: string;
+    
+    if (tool.tool_body) {
+      // If tool_body is already a string, use it directly
+      let bodyStr = typeof tool.tool_body === 'string' ? tool.tool_body : JSON.stringify(tool.tool_body);
+      
+      // Replace template variables in the body string
+      bodyStr = this.replaceTemplateVars(bodyStr, enrichedContext);
+      
+      // Try to parse and re-stringify to ensure valid JSON
+      try {
+        const parsedBody = JSON.parse(bodyStr);
+        body = JSON.stringify(parsedBody);
+      } catch (e) {
+        this.logger.error(`Failed to create valid JSON body after template replacement: ${e.message}`, { 
+          tool_name: tool.tool_name,
+          body_after_replacement: bodyStr 
+        });
+        body = '{}'; // Use empty object if we can't parse it
+      }
+    } else {
+      body = '{}'
+    }
     
     // Process headers with template variables
     const headers: Record<string, string> = {
@@ -317,16 +392,165 @@ export class ToolLoader {
   }
 
   /**
+   * Build context with all step outputs from the workflow execution
+   */
+  private async buildStepContext(workflowExecutionId: string): Promise<Record<string, any>> {
+    try {
+      // Fetch all completed steps from the workflow execution
+      const { data: steps, error } = await this.supabase
+        .from('workflow_execution_steps')
+        .select('step_name, output_data, status')
+        .eq('execution_id', workflowExecutionId)
+        .in('status', ['completed', 'running']) // Include running steps as they may have partial output
+        .order('step_order', { ascending: true });
+
+      if (error) {
+        this.logger.warn('Failed to fetch workflow steps for context', { 
+          error: error.message,
+          workflow_execution_id: workflowExecutionId 
+        });
+        return {};
+      }
+
+      if (!steps || steps.length === 0) {
+        this.logger.warn('No steps found for workflow execution', { 
+          workflow_execution_id: workflowExecutionId 
+        });
+        return {};
+      }
+
+      // Build context with step. prefix for each step's output
+      const stepContext: Record<string, any> = {};
+      
+      for (const step of steps) {
+        if (step.output_data && step.step_name) {
+          // Create a clean step name (remove spaces, make lowercase)
+          const cleanStepName = step.step_name.toLowerCase().replace(/\s+/g, '_');
+          stepContext[`step.${cleanStepName}`] = step.output_data;
+          
+          // Also add without 'step.' prefix for backwards compatibility
+          stepContext[cleanStepName] = step.output_data;
+          
+          this.logger.debug('Added step to context', {
+            original_name: step.step_name,
+            clean_name: cleanStepName,
+            status: step.status,
+            has_output: !!step.output_data,
+            output_keys: step.output_data ? Object.keys(step.output_data).slice(0, 5) : []
+          });
+        }
+      }
+
+      this.logger.info('Built step context for tool execution', {
+        workflow_execution_id: workflowExecutionId,
+        step_count: steps.length,
+        step_names: Object.keys(stepContext).filter(k => k.startsWith('step.')),
+        context_keys: Object.keys(stepContext).slice(0, 10)
+      });
+
+      return stepContext;
+    } catch (error) {
+      this.logger.error('Error building step context', error);
+      return {};
+    }
+  }
+
+  /**
    * Replace template variables in strings
    */
   private replaceTemplateVars(template: string, vars: Record<string, any>): string {
     let result = template;
     
-    // Replace {{variable}} patterns
-    for (const [key, value] of Object.entries(vars)) {
-      const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
-      result = result.replace(regex, String(value || ''));
-    }
+    // Replace {{variable}} and {{nested.path.variable}} patterns
+    // Match both quoted and unquoted template variables
+    const variableRegex = /("?)\{\{([^}]+)\}\}("?)/g;
+    
+    result = result.replace(variableRegex, (match, openQuote, path, closeQuote) => {
+      // Handle nested paths like step.business_logic.steps.get_availability.args.date
+      const trimmedPath = path.trim();
+      const keys = trimmedPath.split('.');
+      let value: any = vars;
+      
+      // Check if this variable is wrapped in quotes
+      const isQuoted = openQuote === '"' && closeQuote === '"';
+      
+      // Special handling for step.* variables
+      if (keys[0] === 'step' && keys.length > 1) {
+        // Check if we have a flattened key like 'step.business_logic'
+        const stepKey = `step.${keys[1]}`;
+        if (stepKey in vars) {
+          // We found the step context, now navigate the remaining path
+          value = vars[stepKey];
+          const remainingKeys = keys.slice(2);
+          
+          for (const key of remainingKeys) {
+            if (value && typeof value === 'object' && key in value) {
+              value = value[key];
+            } else {
+              this.logger.debug(`Variable not found in step context: ${trimmedPath}`, { 
+                step_key: stepKey,
+                remaining_path: remainingKeys.join('.'),
+                available_in_step: value ? Object.keys(value).slice(0, 10) : [],
+                full_path: trimmedPath
+              });
+              return isQuoted ? '""' : '';
+            }
+          }
+        } else {
+          // Try normal navigation
+          for (const key of keys) {
+            if (value && typeof value === 'object' && key in value) {
+              value = value[key];
+            } else {
+              this.logger.debug(`Variable not found: ${trimmedPath}`, { 
+                failed_at_key: key,
+                available_keys: Object.keys(vars).filter(k => k.startsWith('step')).slice(0, 10) 
+              });
+              return isQuoted ? '""' : '';
+            }
+          }
+        }
+      } else {
+        // Normal path navigation for non-step variables
+        for (const key of keys) {
+          if (value && typeof value === 'object' && key in value) {
+            value = value[key];
+          } else {
+            this.logger.debug(`Variable not found: ${trimmedPath}`, { 
+              failed_at_key: key,
+              available_keys: Object.keys(vars).slice(0, 20) 
+            });
+            return isQuoted ? '""' : '';
+          }
+        }
+      }
+      
+      // If the value is undefined or null, return empty string
+      if (value === undefined || value === null) {
+        return isQuoted ? '""' : '';
+      }
+      
+      // If it's an object/array
+      if (typeof value === 'object') {
+        const jsonStr = JSON.stringify(value);
+        // If the original was quoted and we have an object/array, return it unquoted
+        // so it becomes valid JSON (not a string containing JSON)
+        if (isQuoted) {
+          return jsonStr;
+        }
+        return jsonStr;
+      }
+      
+      // For primitive values (string/number/boolean)
+      // If it was quoted in the template, we need to return a quoted string
+      if (isQuoted) {
+        return `"${String(value)}"`;
+      }
+      
+      // If not quoted, return the raw value
+      // Numbers, booleans, and strings in URLs should not be quoted
+      return String(value);
+    });
     
     return result;
   }
@@ -336,13 +560,36 @@ export class ToolLoader {
    */
   private extractUsedVariables(template: string, context: Record<string, any>): Record<string, any> {
     const usedVars: Record<string, any> = {};
-    const varPattern = /\{\{(\w+)\}\}/g;
+    const varPattern = /\{\{([^}]+)\}\}/g;
     let match;
     
     while ((match = varPattern.exec(template)) !== null) {
-      const varName = match[1];
-      if (context[varName] !== undefined) {
-        usedVars[varName] = context[varName];
+      const path = match[1].trim();
+      const keys = path.split('.');
+      let value: any = context;
+      let validPath = true;
+      
+      // Navigate through nested path
+      for (const key of keys) {
+        if (value && typeof value === 'object' && key in value) {
+          value = value[key];
+        } else {
+          validPath = false;
+          break;
+        }
+      }
+      
+      // Store the variable with its full path as key
+      if (validPath && value !== undefined) {
+        // For nested paths, we store the whole branch
+        if (keys.length > 1) {
+          const topLevelKey = keys[0];
+          if (!usedVars[topLevelKey] && context[topLevelKey]) {
+            usedVars[topLevelKey] = context[topLevelKey];
+          }
+        } else {
+          usedVars[path] = value;
+        }
       }
     }
     
