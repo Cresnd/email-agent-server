@@ -60,7 +60,7 @@ export class StructuredOutputParser {
    */
   private convertLegacyOutput(output: any): StructuredOutput {
     const actionType = output.decision?.action_type || output.action_type || 'answer_question';
-    const extraction = output.refined_extraction || {};
+    const extraction = this.normalizeExtraction(output.refined_extraction || {});
 
     const structuredOutput: StructuredOutput = {
       intent: extraction.intent || this.mapActionToIntent(actionType),
@@ -112,20 +112,21 @@ export class StructuredOutputParser {
    * Identify missing required fields based on action type
    */
   private identifyMissingFields(extraction: any, actionType: string): string[] {
+    const normalized = this.normalizeExtraction(extraction);
     const missingFields: string[] = [];
 
     if (actionType === 'make_booking') {
       const requiredFields = ['first_name', 'last_name', 'phone_number', 'email', 'date', 'guest_count'];
       
       for (const field of requiredFields) {
-        if (!extraction[field] || extraction[field] === '' || extraction[field] === null) {
+        if (!normalized[field] || normalized[field] === '' || normalized[field] === null) {
           missingFields.push(field);
         }
       }
     }
 
     if (actionType === 'edit_booking' || actionType === 'cancel_booking') {
-      if (!extraction.bookingref || extraction.bookingref === '') {
+      if (!normalized.bookingref || normalized.bookingref === '') {
         missingFields.push('bookingref');
       }
     }
@@ -137,6 +138,7 @@ export class StructuredOutputParser {
    * Generate execution steps based on action type and extraction data
    */
   private generateStepsFromAction(actionType: string, extraction: any): Step[] {
+    const normalized = this.normalizeExtraction(extraction);
     const steps: Step[] = [];
 
     switch (actionType) {
@@ -146,27 +148,32 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'get_availability',
           args: {
-            date: extraction.date || '',
-            guest_count: extraction.guest_count || '',
-            requests: extraction.requests || []
+            date: normalized.date || '',
+            guest_count: normalized.guest_count || '',
+            guests: normalized.guest_count || '',
+            requests: normalized.requests || []
           }
         });
 
         // Step 2: Make booking (only if no missing fields)
-        if (extraction.first_name && extraction.last_name && extraction.phone_number) {
+        if (normalized.first_name && normalized.last_name && normalized.phone_number) {
           steps.push({
             number: 2,
             tool: 'make_booking',
             args: {
-              first_name: extraction.first_name || '',
-              last_name: extraction.last_name || '',
-              phone_number: extraction.phone_number || '',
-              email: extraction.email || '',
-              date: extraction.date || '',
-              guest_count: extraction.guest_count || '',
-              requests: extraction.requests || [],
-              comment: extraction.comment || '',
-              waitlist: extraction.waitlist || false
+              first_name: normalized.first_name || '',
+              firstName: normalized.first_name || '',
+              last_name: normalized.last_name || '',
+              lastName: normalized.last_name || '',
+              phone_number: normalized.phone_number || '',
+              phone: normalized.phone_number || '',
+              email: normalized.email || '',
+              date: normalized.date || '',
+              guest_count: normalized.guest_count || '',
+              guests: normalized.guest_count || '',
+              requests: normalized.requests || [],
+              comment: normalized.comment || '',
+              waitlist: normalized.waitlist || false
             }
           });
         }
@@ -177,9 +184,12 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'find_booking',
           args: {
-            bookingref: extraction.bookingref || '',
-            email: extraction.email || '',
-            phone_number: extraction.phone_number || ''
+            bookingref: normalized.bookingref || '',
+            email: normalized.email || '',
+            phone_number: normalized.phone_number || '',
+            phone: normalized.phone_number || '',
+            first_name: normalized.first_name || '',
+            last_name: normalized.last_name || ''
           }
         });
 
@@ -187,11 +197,12 @@ export class StructuredOutputParser {
           number: 2,
           tool: 'update_booking',
           args: {
-            bookingref: extraction.bookingref || '',
-            date: extraction.date || '',
-            guest_count: extraction.guest_count || '',
-            requests: extraction.requests || [],
-            comment: extraction.comment || ''
+            bookingref: normalized.bookingref || '',
+            date: normalized.date || '',
+            guest_count: normalized.guest_count || '',
+            guests: normalized.guest_count || '',
+            requests: normalized.requests || [],
+            comment: normalized.comment || ''
           }
         });
         break;
@@ -201,9 +212,12 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'find_booking',
           args: {
-            bookingref: extraction.bookingref || '',
-            email: extraction.email || '',
-            phone_number: extraction.phone_number || ''
+            bookingref: normalized.bookingref || '',
+            email: normalized.email || '',
+            phone_number: normalized.phone_number || '',
+            phone: normalized.phone_number || '',
+            first_name: normalized.first_name || '',
+            last_name: normalized.last_name || ''
           }
         });
 
@@ -211,8 +225,8 @@ export class StructuredOutputParser {
           number: 2,
           tool: 'cancel_booking',
           args: {
-            bookingref: extraction.bookingref || '',
-            reason: extraction.comment || ''
+            bookingref: normalized.bookingref || '',
+            reason: normalized.comment || ''
           }
         });
         break;
@@ -222,12 +236,13 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'search_bookings',
           args: {
-            bookingref: extraction.bookingref || '',
-            email: extraction.email || '',
-            phone_number: extraction.phone_number || '',
-            date: extraction.date || '',
-            first_name: extraction.first_name || '',
-            last_name: extraction.last_name || ''
+            bookingref: normalized.bookingref || '',
+            email: normalized.email || '',
+            phone_number: normalized.phone_number || '',
+            phone: normalized.phone_number || '',
+            date: normalized.date || '',
+            first_name: normalized.first_name || '',
+            last_name: normalized.last_name || ''
           }
         });
         break;
@@ -237,7 +252,7 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'generate_response',
           args: {
-            query: extraction.message_for_ai || extraction.description || '',
+            query: normalized.message_for_ai || normalized.description || '',
             context: {
               venue_info: true,
               booking_policies: true
@@ -251,8 +266,8 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'request_additional_info',
           args: {
-            missing_fields: this.identifyMissingFields(extraction, actionType),
-            context: extraction.description || ''
+            missing_fields: this.identifyMissingFields(normalized, actionType),
+            context: normalized.description || ''
           }
         });
         break;
@@ -262,7 +277,7 @@ export class StructuredOutputParser {
           number: 1,
           tool: 'escalate_to_human',
           args: {
-            reason: extraction.description || 'Manual review required',
+            reason: normalized.description || 'Manual review required',
             priority: 'medium'
           }
         });
@@ -281,6 +296,32 @@ export class StructuredOutputParser {
       tool: step.tool || 'unknown_tool',
       args: step.args || {}
     }));
+  }
+
+  /**
+   * Normalize extraction fields so we can support both snake_case and camelCase inputs
+   */
+  private normalizeExtraction(extraction: any): any {
+    if (!extraction || typeof extraction !== 'object') {
+      return {};
+    }
+
+    return {
+      ...extraction,
+      first_name: extraction.first_name ?? extraction.firstName ?? '',
+      last_name: extraction.last_name ?? extraction.lastName ?? '',
+      phone_number: extraction.phone_number ?? extraction.phone ?? extraction.phoneNumber ?? '',
+      email: extraction.email ?? extraction.email_address ?? extraction.emailAddress ?? '',
+      guest_count: extraction.guest_count ?? extraction.guests ?? extraction.guestCount ?? '',
+      requests: extraction.requests ?? [],
+      comment: extraction.comment ?? '',
+      date: extraction.date ?? '',
+      bookingref: extraction.bookingref ?? extraction.booking_ref ?? extraction.bookingRef ?? '',
+      intent: extraction.intent ?? extraction.action ?? '',
+      action: extraction.action ?? extraction.intent ?? '',
+      message_for_ai: extraction.message_for_ai ?? extraction.message ?? '',
+      description: extraction.description ?? ''
+    };
   }
 
   /**

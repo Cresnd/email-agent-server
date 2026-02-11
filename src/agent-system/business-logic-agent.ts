@@ -100,6 +100,12 @@ export class BusinessLogicAgent {
       if (input.resolved_prompt) {
         aiInput = input.resolved_prompt;
         processingNotes.push(`Using resolved prompt from workflow variables`);
+
+        const directResult = await this.tryProcessStructuredPrompt(aiInput, input.parsing_output, processingNotes);
+        if (directResult) {
+          processingNotes.push('Structured JSON detected in business_logic prompt - skipping orchestrator call');
+          return directResult;
+        }
       } else {
         aiInput = this.prepareOrchestratorInput(input);
         processingNotes.push(`Prepared orchestrator input for action: ${input.parsing_output.extraction_result.action}`);
@@ -188,6 +194,102 @@ PARSED EMAIL EXTRACTION:
 CURRENT BOOKINGS: ${JSON.stringify(input.current_bookings || [])}
 AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
     `.trim();
+  }
+
+  /**
+   * Attempt to turn a JSON payload provided in the prompt into a structured result without another AI call
+   */
+  private async tryProcessStructuredPrompt(
+    rawPrompt: string | undefined,
+    parsingOutput: ParsingAgentOutput,
+    processingNotes: string[]
+  ): Promise<BusinessLogicAgentOutput | null> {
+    if (!rawPrompt) return null;
+
+    let parsed: any;
+    try {
+      parsed = typeof rawPrompt === 'string' ? JSON.parse(rawPrompt) : rawPrompt;
+    } catch (error) {
+      processingNotes.push(`Resolved prompt was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+
+    let payload = parsed;
+    if (Array.isArray(payload)) {
+      payload = payload[0];
+    }
+    if (payload?.output) {
+      payload = payload.output;
+    }
+
+    if (!payload || typeof payload !== 'object') {
+      return null;
+    }
+
+    const extractionSource =
+      payload.extracted_data ||
+      payload.refined_extraction ||
+      payload.extraction ||
+      payload;
+
+    const refined_extraction = {
+      ...parsingOutput.extraction_result,
+      ...extractionSource,
+      first_name: extractionSource.first_name ?? extractionSource.firstName ?? parsingOutput.extraction_result.first_name ?? '',
+      last_name: extractionSource.last_name ?? extractionSource.lastName ?? parsingOutput.extraction_result.last_name ?? '',
+      guest_count: extractionSource.guest_count ?? extractionSource.guests ?? parsingOutput.extraction_result.guest_count ?? null,
+      comment: extractionSource.comment ?? parsingOutput.extraction_result.comment ?? '',
+      date: extractionSource.date ?? parsingOutput.extraction_result.date ?? '',
+      phone_number: extractionSource.phone_number ?? extractionSource.phone ?? parsingOutput.extraction_result.phone_number ?? '',
+      requests: extractionSource.requests ?? parsingOutput.extraction_result.requests ?? [],
+      search_time: extractionSource.search_time ?? parsingOutput.extraction_result.search_time ?? '',
+      new_time: extractionSource.new_time ?? parsingOutput.extraction_result.new_time ?? '',
+      intent: extractionSource.intent ?? parsingOutput.extraction_result.intent ?? 'general_question',
+      action: extractionSource.action ?? parsingOutput.extraction_result.action ?? 'answer_question',
+      request_details: extractionSource.request_details ?? parsingOutput.extraction_result.request_details ?? {},
+      description: extractionSource.description ?? parsingOutput.extraction_result.description ?? '',
+      message_for_ai: extractionSource.message_for_ai ?? parsingOutput.extraction_result.message_for_ai ?? '',
+      email: extractionSource.email ?? parsingOutput.extraction_result.email ?? '',
+      waitlist: extractionSource.waitlist ?? parsingOutput.extraction_result.waitlist ?? false,
+      keep_original_time: extractionSource.keep_original_time ?? parsingOutput.extraction_result.keep_original_time ?? true,
+      bookingref: extractionSource.bookingref ?? parsingOutput.extraction_result.bookingref ?? '',
+      language: extractionSource.language ?? extractionSource.lang ?? parsingOutput.extraction_result.language ?? 'en'
+    };
+
+    const actionType = payload.action || refined_extraction.action || 'answer_question';
+    const intent = payload.intent || refined_extraction.intent || this.mapActionToIntent(actionType);
+
+    const baseResult: BusinessLogicAgentOutput = {
+      decision: {
+        action_type: actionType as BusinessLogicAgentOutput['decision']['action_type'],
+        reasoning: 'Used structured JSON provided in business_logic node prompt',
+        confidence: 0.9,
+        requires_human_review: false
+      },
+      refined_extraction,
+      guardrail_status: 'passed',
+      guardrail_violations: [],
+      processed_at: new Date().toISOString(),
+      processing_notes: processingNotes
+    };
+
+    const structuredPayload = {
+      intent,
+      action: actionType,
+      missing_fields: payload.missing_fields || payload.missingFields || [],
+      steps: payload.steps || []
+    };
+
+    const structured_output = await this.structuredOutputParser.parse(
+      (structuredPayload.steps && structuredPayload.steps.length > 0) || (structuredPayload.missing_fields && structuredPayload.missing_fields.length > 0)
+        ? { ...baseResult, _structured_output: structuredPayload }
+        : baseResult
+    );
+
+    return {
+      ...baseResult,
+      structured_output
+    };
   }
 
   /**
@@ -455,5 +557,19 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
       ...baseResult,
       structured_output: structuredOutput
     };
+  }
+
+  private mapActionToIntent(actionType: string): string {
+    const intentMap: Record<string, string> = {
+      make_booking: 'make_booking',
+      edit_booking: 'edit_booking',
+      cancel_booking: 'cancel_booking',
+      find_booking: 'find_booking',
+      answer_question: 'general_question',
+      request_info: 'request_info',
+      escalate: 'escalate'
+    };
+
+    return intentMap[actionType] || 'general_question';
   }
 }

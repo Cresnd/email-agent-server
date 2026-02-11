@@ -109,6 +109,7 @@ export interface EmailProcessingContext {
 export interface AgentPipelineResult {
   success: boolean;
   agent_run_id: string;
+  cancelled?: boolean;
   
   // Agent outputs
   parsing_output?: ParsingAgentOutput;
@@ -179,6 +180,7 @@ export class AgentManager {
     const agentRunId = this.generateRunId();
     const startTime = Date.now();
     const processingNotes: string[] = [];
+    let executionCancelled = false;
     
     this.logger.info('Starting agent pipeline execution', {
       agent_run_id: agentRunId,
@@ -263,13 +265,10 @@ export class AgentManager {
       while (executionQueue.length > 0) {
         // Check if execution has been cancelled
         if (workflowExecutionId) {
-          const { data: execution } = await this.db.supabase
-            .from('workflow_executions')
-            .select('status')
-            .eq('id', workflowExecutionId)
-            .single();
+          executionCancelled = await this.isExecutionCancelled(workflowExecutionId);
           
-          if (execution?.status === 'cancelled') {
+          if (executionCancelled) {
+            processingNotes.push('Execution cancelled - stopping pipeline');
             this.logger.info('⛔ Execution cancelled - stopping pipeline', { 
               workflowExecutionId,
               remaining_steps: executionQueue.length
@@ -888,6 +887,45 @@ export class AgentManager {
       }
 
       // Log when execution queue becomes empty
+      if (executionCancelled) {
+        const totalExecutionTime = Date.now() - startTime;
+        const finalBusinessLogicOutput = businessLogicOutput?.structured_output ? businessLogicOutput.structured_output : businessLogicOutput;
+
+        // Ensure any remaining steps are marked as skipped/cancelled for a clean UI state
+        if (workflowExecutionId) {
+          await this.markPendingStepsAsSkipped(workflowExecutionId);
+        }
+
+        const cancellationResult: AgentPipelineResult = {
+          success: false,
+          cancelled: true,
+          agent_run_id: agentRunId,
+          parsing_output: parsingOutput,
+          business_logic_output: finalBusinessLogicOutput,
+          action_execution_output: actionExecutionOutput,
+          total_execution_time_ms: totalExecutionTime,
+          agent_execution_times: {
+            parsing_agent_ms: parsingTime,
+            business_logic_agent_ms: businessLogicTime,
+            action_execution_agent_ms: actionExecutionTime
+          },
+          error_message: 'Execution cancelled',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          processing_notes: [...processingNotes, 'Execution cancelled before completion']
+        };
+
+        await this.logPipelineFailure(agentRunId, cancellationResult);
+
+        this.logger.info('Agent pipeline cancelled', {
+          agent_run_id: agentRunId,
+          workflowExecutionId,
+          total_time_ms: totalExecutionTime
+        });
+
+        return cancellationResult;
+      }
+
       this.logger.info('📋 EXECUTION QUEUE EMPTY - Workflow execution completed', {
         total_steps_executed: orderedSteps.length,
         processing_notes_count: processingNotes.length
@@ -1006,6 +1044,28 @@ export class AgentManager {
   }
 
   /**
+   * Mark any pending or running steps as skipped when an execution is cancelled
+   */
+  private async markPendingStepsAsSkipped(workflowExecutionId: string) {
+    try {
+      const nowIso = new Date().toISOString();
+      await this.db.supabase
+        .from('workflow_execution_steps')
+        .update({
+          status: 'skipped',
+          completed_at: nowIso
+        })
+        .eq('execution_id', workflowExecutionId)
+        .in('status', ['pending', 'running']);
+    } catch (error) {
+      this.logger.warn('Failed to mark pending steps as skipped after cancellation', {
+        workflowExecutionId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
    * Execute an agent with comprehensive logging
    */
   private async executeWithLogging<T>(
@@ -1036,6 +1096,29 @@ export class AgentManager {
       await this.logAgentFailure(agentRunId, agentType, error, executionTime);
       
       throw error;
+    }
+  }
+
+  /**
+   * Check if a workflow execution has been cancelled
+   */
+  private async isExecutionCancelled(workflowExecutionId?: string | null): Promise<boolean> {
+    if (!workflowExecutionId) return false;
+
+    try {
+      const { data: execution } = await this.db.supabase
+        .from('workflow_executions')
+        .select('status')
+        .eq('id', workflowExecutionId)
+        .single();
+
+      return execution?.status === 'cancelled';
+    } catch (error) {
+      this.logger.warn('Could not check execution cancellation status', { 
+        workflowExecutionId, 
+        error: error instanceof Error ? error.message : String(error) 
+      });
+      return false;
     }
   }
 
@@ -1160,6 +1243,19 @@ export class AgentManager {
     workflowExecutionId: string | null
   ) {
     if (nextNodes.length === 0) return;
+    
+    // Check if execution has been cancelled before queuing new nodes
+    if (workflowExecutionId) {
+      const executionCancelled = await this.isExecutionCancelled(workflowExecutionId);
+      
+      if (executionCancelled) {
+        this.logger.info('⛔ Execution cancelled - not queuing new nodes', { 
+          workflowExecutionId,
+          nodes_not_queued: nextNodes.map(n => n.name)
+        });
+        return; // Don't queue any new nodes if cancelled
+      }
+    }
     
     // Add nodes to execution queue
     executionQueue.push(...nextNodes);

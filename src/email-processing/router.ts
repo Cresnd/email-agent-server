@@ -48,6 +48,8 @@ export interface EmailProcessingRequest {
 export interface EmailProcessingResponse {
   success: boolean;
   message: string;
+  cancelled?: boolean;
+  workflow_execution_id?: string;
   agent_run_id?: string;
   processing_time_ms?: number;
   email_operations?: {
@@ -173,7 +175,7 @@ export class EmailProcessor {
         processing_time_ms: processingTime
       });
 
-      ctx.response.status = result.success ? 200 : 500;
+      ctx.response.status = result.cancelled ? 200 : (result.success ? 200 : 500);
       ctx.response.body = result;
 
     } catch (error) {
@@ -212,7 +214,7 @@ export class EmailProcessor {
 
       const result = await this.processEmail(body, 'manual', requestId);
       
-      ctx.response.status = result.success ? 200 : 500;
+      ctx.response.status = result.cancelled ? 200 : (result.success ? 200 : 500);
       ctx.response.body = result;
 
     } catch (error) {
@@ -384,6 +386,7 @@ export class EmailProcessor {
       let workflowExecutionId: string;
       let isRerun = false;
       let parentExecutionId: string | null = null;
+      let existingExecution: any = null;
       
       if (emailPayload.execution_id && emailPayload.parent_execution_id) {
         // This is a rerun from the edge function with explicit parent - use the provided execution ID
@@ -394,6 +397,11 @@ export class EmailProcessor {
           workflowExecutionId,
           parent_execution_id: parentExecutionId
         });
+        try {
+          existingExecution = await this.db.getWorkflowExecution(workflowExecutionId);
+        } catch (err) {
+          this.logger.warn('Could not fetch existing execution for rerun', { workflowExecutionId, error: err instanceof Error ? err.message : String(err) });
+        }
       } else if (emailPayload.execution_id && !emailPayload.parent_execution_id) {
         // Execution ID provided but no parent - this is a rerun where execution_id IS the parent
         // Generate a new execution ID for the rerun
@@ -416,6 +424,19 @@ export class EmailProcessor {
       }
       
       try {
+        // Stop immediately if this rerun was already cancelled
+        if (isRerun && existingExecution?.status === 'cancelled') {
+          const processingTime = Date.now() - startTime;
+          this.logger.info('Rerun aborted because execution is already cancelled', { workflowExecutionId });
+          return {
+            success: false,
+            cancelled: true,
+            message: 'Execution was already cancelled',
+            workflow_execution_id: workflowExecutionId,
+            processing_time_ms: processingTime
+          };
+        }
+
         if (!isRerun) {
           // Only create new execution if this is NOT a rerun
           await this.db.createWorkflowExecution({
@@ -439,6 +460,12 @@ export class EmailProcessor {
           // Trigger step gets: input_data = raw webhook, output_data = venue config wall
           await this.db.createWorkflowExecutionSteps(workflowExecutionId, venueWorkflowId, emailPayload, emailPayload.pinned_steps, venueConfigWall);
           this.logger.info('Workflow execution steps created successfully', { workflowExecutionId });
+
+          // Immediately mark execution as running so the UI shows active state for new (non-rerun) executions
+          await this.db.updateWorkflowExecution(workflowExecutionId, {
+            status: 'running',
+            started_at: new Date().toISOString()
+          });
         } else {
           // For reruns, update the status to running and create steps
           await this.db.updateWorkflowExecution(workflowExecutionId, {
@@ -475,6 +502,36 @@ export class EmailProcessor {
         this.logger.debug('Email operations executed', { request_id: requestId, operations: emailOperations });
       }
       
+      // Respect cancellation status and avoid overriding it
+      let executionRecord: { status?: string; finished_at?: string; duration_ms?: number; end_time?: string } | null = null;
+      try {
+        const { data, error } = await this.db.supabase
+          .from('workflow_executions')
+          .select('status, finished_at, duration_ms, end_time')
+          .eq('id', workflowExecutionId)
+          .single();
+
+        if (!error) {
+          executionRecord = data;
+        } else {
+          this.logger.warn('Could not fetch workflow execution status after pipeline', {
+            workflowExecutionId,
+            error: error.message
+          });
+        }
+      } catch (statusError) {
+        this.logger.warn('Error while fetching workflow execution status after pipeline', {
+          workflowExecutionId,
+          error: statusError instanceof Error ? statusError.message : String(statusError)
+        });
+      }
+
+        const wasCancelled = pipelineResult.cancelled || executionRecord?.status === 'cancelled';
+        const finalStatus: 'completed' | 'failed' | 'cancelled' = wasCancelled ? 'cancelled' : (pipelineResult.success ? 'completed' : 'failed');
+        const logStatus = finalStatus === 'cancelled' ? 'failed' : finalStatus; // email_processing_log constraint
+        const statusErrorMessage = wasCancelled ? 'Execution cancelled' : pipelineResult.error_message;
+        const nowIso = new Date().toISOString();
+
       // Log email processing to database
       try {
         // Get or create email account ID (using a fallback for testing)
@@ -490,8 +547,8 @@ export class EmailProcessor {
           email_from: emailPayload.from || '',
           email_to: emailPayload.to || '',
           email_date: emailPayload.date || new Date().toISOString(),
-          processing_status: pipelineResult.success ? 'completed' : 'failed',
-          error_message: pipelineResult.error_message,
+          processing_status: logStatus,
+          error_message: statusErrorMessage,
           processing_time_ms: pipelineResult.total_execution_time_ms,
           processed_at: new Date().toISOString()
         });
@@ -502,22 +559,33 @@ export class EmailProcessor {
         try {
           
           // Update workflow execution with completion status
+          const workflowUpdatePayload: any = {
+            status: finalStatus,
+            current_step: wasCancelled ? 'execution_cancelled' : 'email_processing_complete',
+            error_message: statusErrorMessage
+          };
+
+          if (!executionRecord?.finished_at) {
+            workflowUpdatePayload.finished_at = nowIso;
+          }
+
+          if (!executionRecord?.duration_ms) {
+            workflowUpdatePayload.duration_ms = pipelineResult.total_execution_time_ms;
+          }
+
+          if (!executionRecord?.end_time) {
+            workflowUpdatePayload.end_time = nowIso;
+          }
+
           await this.db.updateWorkflowExecution(
             workflowExecutionId,
-            {
-              status: pipelineResult.success ? 'completed' : 'failed',
-              finished_at: new Date().toISOString(),
-              duration_ms: pipelineResult.total_execution_time_ms,
-              current_step: 'email_processing_complete',
-              end_time: new Date().toISOString(),
-              error_message: pipelineResult.error_message
-            }
+            workflowUpdatePayload
           );
           
-          this.logger.info('Workflow execution completed successfully', { 
+          this.logger.info(wasCancelled ? 'Workflow execution cancelled' : 'Workflow execution completed successfully', { 
             request_id: requestId, 
             workflowExecutionId,
-            status: pipelineResult.success ? 'completed' : 'failed'
+            status: finalStatus
           });
         } catch (workflowLogError) {
           this.logger.error('Failed to log workflow execution', {
@@ -537,12 +605,14 @@ export class EmailProcessor {
       }
       
       return {
-        success: pipelineResult.success,
-        message: pipelineResult.success ? 'Email processed successfully' : 'Email processing failed',
+        success: !wasCancelled && pipelineResult.success,
+        cancelled: wasCancelled,
+        message: wasCancelled ? 'Execution cancelled' : (pipelineResult.success ? 'Email processed successfully' : 'Email processing failed'),
+        workflow_execution_id: workflowExecutionId,
         agent_run_id: pipelineResult.agent_run_id,
         processing_time_ms: pipelineResult.total_execution_time_ms,
         email_operations: emailOperations,
-        error_details: pipelineResult.error_message
+        error_details: statusErrorMessage
       };
 
     } catch (error) {
@@ -641,12 +711,45 @@ export class EmailProcessor {
         workflow_execution_id: workflowExecutionId
       });
 
+      // Fetch execution to compute duration and avoid cancelling a finished one
+      let existingExecution: any = null;
+      try {
+        const { data } = await this.db.supabase
+          .from('workflow_executions')
+          .select('status, started_at')
+          .eq('id', workflowExecutionId)
+          .single();
+        existingExecution = data;
+      } catch (error) {
+        this.logger.warn('Could not fetch execution before cancellation', {
+          workflow_execution_id: workflowExecutionId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+
+      // If already cancelled, return early
+      if (existingExecution?.status === 'cancelled') {
+        ctx.response.body = {
+          success: true,
+          message: 'Execution already cancelled',
+          workflow_execution_id: workflowExecutionId,
+          cancelled_steps: 0,
+          request_id: requestId
+        };
+        return;
+      }
+
       // Update workflow execution status to 'cancelled'
       try {
+        const nowIso = new Date().toISOString();
+        const startedAt = existingExecution?.started_at ? new Date(existingExecution.started_at).getTime() : null;
+        const durationMs = startedAt ? Date.now() - startedAt : Date.now() - startTime;
+
         await this.db.updateWorkflowExecution(workflowExecutionId, {
           status: 'cancelled',
-          finished_at: new Date().toISOString(),
-          duration_ms: Date.now() - startTime
+          finished_at: nowIso,
+          end_time: nowIso,
+          duration_ms: durationMs
         });
 
         // Also cancel any running steps
@@ -654,28 +757,49 @@ export class EmailProcessor {
           .from('workflow_execution_steps')
           .select('*')
           .eq('execution_id', workflowExecutionId)
-          .eq('status', 'running');
+          .in('status', ['running', 'pending']);
+
+        let cancelledSteps = 0;
 
         if (steps && steps.length > 0) {
           for (const step of steps) {
+            const nextStatus = step.status === 'running' ? 'cancelled' : 'skipped';
             await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.node_id, {
-              status: 'cancelled',
-              finished_at: new Date().toISOString()
+              status: nextStatus as any,
+              completed_at: nowIso
             });
+            cancelledSteps++;
+          }
+        }
+
+        // Ensure any remaining pending steps are marked skipped to avoid dangling states
+        const { data: remainingPending } = await this.db.supabase
+          .from('workflow_execution_steps')
+          .select('node_id')
+          .eq('execution_id', workflowExecutionId)
+          .eq('status', 'pending');
+
+        if (remainingPending && remainingPending.length > 0) {
+          for (const step of remainingPending) {
+            await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.node_id, {
+              status: 'skipped',
+              completed_at: nowIso
+            });
+            cancelledSteps++;
           }
         }
 
         this.logger.info('Execution cancelled successfully', {
           request_id: requestId,
           workflow_execution_id: workflowExecutionId,
-          cancelled_steps: steps?.length || 0
+          cancelled_steps: cancelledSteps
         });
 
         ctx.response.body = {
           success: true,
           message: 'Execution cancelled successfully',
           workflow_execution_id: workflowExecutionId,
-          cancelled_steps: steps?.length || 0,
+          cancelled_steps: cancelledSteps,
           request_id: requestId
         };
 

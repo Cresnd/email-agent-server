@@ -274,7 +274,7 @@ export class DatabaseQueries {
     email_from?: string;
     email_to?: string;
     email_date?: string;
-    processing_status: 'pending' | 'processing' | 'completed' | 'failed' | 'ignored';
+    processing_status: 'pending' | 'processing' | 'completed' | 'failed' | 'ignored' | 'cancelled';
     error_message?: string;
     processing_time_ms?: number;
     processed_at: string;
@@ -355,6 +355,23 @@ export class DatabaseQueries {
     }
   ): Promise<void> {
     
+    // Avoid downgrading a cancelled execution back to running/completed
+    if (updates.status && updates.status !== 'cancelled') {
+      const { data: current, error: fetchError } = await this.supabase
+        .from('workflow_executions')
+        .select('status')
+        .eq('id', executionId)
+        .single();
+
+      if (!fetchError && current?.status === 'cancelled') {
+        this.logger.info('Skipping execution update because it is already cancelled', {
+          execution_id: executionId,
+          attempted_status: updates.status
+        });
+        return;
+      }
+    }
+
     const { error } = await this.supabase
       .from('workflow_executions')
       .update(updates)
@@ -404,7 +421,7 @@ export class DatabaseQueries {
   async updateStepExecution(
     stepExecutionId: string,
     updates: {
-      status?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+      status?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
       output_data?: any;
       error_message?: string;
       end_time?: string;
@@ -820,12 +837,13 @@ export class DatabaseQueries {
     executionId: string,
     nodeId: string,
     updates: {
-      status?: 'pending' | 'running' | 'completed' | 'failed';
+      status?: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'skipped';
       input_data?: any;
       output_data?: any;
       error_details?: any;
       started_at?: string;
       completed_at?: string;
+      finished_at?: string;
       output_confidence_score?: number;
       output_tokens_consumed?: number;
       output_processing_time_ms?: number;
@@ -833,6 +851,25 @@ export class DatabaseQueries {
     }
   ): Promise<void> {
     
+    // Avoid overwriting already-cancelled steps
+    if (updates.status && updates.status !== 'cancelled') {
+      const { data: currentStep, error: fetchError } = await this.supabase
+        .from('workflow_execution_steps')
+        .select('status')
+        .eq('execution_id', executionId)
+        .eq('node_id', nodeId)
+        .single();
+
+      if (!fetchError && currentStep?.status === 'cancelled') {
+        this.logger.info('Skipping step update because execution step is cancelled', {
+          execution_id: executionId,
+          node_id: nodeId,
+          attempted_status: updates.status
+        });
+        return;
+      }
+    }
+
     const { error } = await this.supabase
       .from('workflow_execution_steps')
       .update(updates)
