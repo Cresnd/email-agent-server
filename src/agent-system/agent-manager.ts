@@ -724,9 +724,31 @@ export class AgentManager {
             // Use the new structured output format as the main output for business logic agents
             let businessLogicStepOutput: Record<string, any>;
             if (businessLogicOutput.structured_output) {
-              // Replace the entire business logic output with the structured format
-              businessLogicStepOutput = businessLogicOutput.structured_output;
-              processingNotes.push(`Using structured output format - Intent: ${businessLogicOutput.structured_output.intent}, Action: ${businessLogicOutput.structured_output.action}`);
+              // Ensure proper field ordering by reconstructing the object
+              const structured = businessLogicOutput.structured_output;
+              
+              // First order the steps by number
+              const orderedSteps: Record<string, any> = {};
+              if (structured.steps && typeof structured.steps === 'object') {
+                const stepEntries = Object.entries(structured.steps as Record<string, any>);
+                stepEntries.sort((a: any, b: any) => {
+                  const aNum = a[1]?.number || 0;
+                  const bNum = b[1]?.number || 0;
+                  return aNum - bNum;
+                });
+                stepEntries.forEach(([key, value]) => {
+                  orderedSteps[key] = value;
+                });
+              }
+              
+              // Create output with explicit field order
+              businessLogicStepOutput = {};
+              businessLogicStepOutput.intent = structured.intent;
+              businessLogicStepOutput.action = structured.action;
+              businessLogicStepOutput.missing_fields = structured.missing_fields;
+              businessLogicStepOutput.steps = orderedSteps;
+              
+              processingNotes.push(`Using structured output format - Intent: ${structured.intent}, Action: ${structured.action}`);
             } else {
               // Fallback to legacy format if structured output is not available
               businessLogicStepOutput = {

@@ -45,13 +45,8 @@ export class StructuredOutputParser {
     } catch (error) {
       console.error('Error parsing structured output:', error);
       
-      // Return fallback structure
-      return {
-        intent: "unknown",
-        action: "escalate", 
-        missing_fields: ["parsing_error"],
-        steps: []
-      };
+      // Return fallback structure with correct field order
+      return this.createOrderedOutput("unknown", "escalate", ["parsing_error"], {});
     }
   }
 
@@ -65,14 +60,12 @@ export class StructuredOutputParser {
     const steps = this.generateStepsFromAction(actionType, extraction);
     const orderedSteps = this.orderStepsByNumber(steps);
 
-    const structuredOutput: StructuredOutput = {
-      intent: extraction.intent || this.mapActionToIntent(actionType),
-      action: actionType,
-      missing_fields: this.identifyMissingFields(extraction, actionType),
-      steps: orderedSteps
-    };
-
-    return structuredOutput;
+    return this.createOrderedOutput(
+      extraction.intent || this.mapActionToIntent(actionType),
+      actionType,
+      this.identifyMissingFields(extraction, actionType),
+      orderedSteps
+    );
   }
 
   /**
@@ -89,14 +82,12 @@ export class StructuredOutputParser {
     // Order steps by number
     const orderedSteps = this.orderStepsByNumber(steps);
 
-    const result: StructuredOutput = {
-      intent: structuredOutput.intent || "unknown",
-      action: structuredOutput.action || "answer_question",
-      missing_fields: Array.isArray(structuredOutput.missing_fields) ? structuredOutput.missing_fields : [],
-      steps: orderedSteps
-    };
-
-    return result;
+    return this.createOrderedOutput(
+      structuredOutput.intent || "unknown",
+      structuredOutput.action || "answer_question",
+      Array.isArray(structuredOutput.missing_fields) ? structuredOutput.missing_fields : [],
+      orderedSteps
+    );
   }
 
   /**
@@ -291,6 +282,24 @@ export class StructuredOutputParser {
     }
 
     return steps;
+  }
+
+  /**
+   * Create output with guaranteed field order
+   */
+  private createOrderedOutput(
+    intent: string,
+    action: string,
+    missingFields: string[],
+    steps: Record<string, Step>
+  ): StructuredOutput {
+    // Create new object with explicit field ordering
+    const output = {} as any;
+    output.intent = intent;
+    output.action = action;
+    output.missing_fields = missingFields;
+    output.steps = steps;
+    return output as StructuredOutput;
   }
 
   /**

@@ -870,9 +870,40 @@ export class DatabaseQueries {
       }
     }
 
+    // Special handling for output_data to preserve field order
+    const processedUpdates = { ...updates };
+    if (updates.output_data && updates.output_data.intent !== undefined) {
+      // This is a business logic output - ensure field order
+      const orderedOutput: any = {};
+      
+      // Add fields in specific order
+      orderedOutput.intent = updates.output_data.intent;
+      orderedOutput.action = updates.output_data.action;
+      orderedOutput.missing_fields = updates.output_data.missing_fields;
+      
+      // Order steps by number
+      if (updates.output_data.steps) {
+        const orderedSteps: any = {};
+        const stepEntries = Object.entries(updates.output_data.steps);
+        stepEntries.sort((a: any, b: any) => {
+          const aNum = a[1]?.number || 0;
+          const bNum = b[1]?.number || 0;
+          return aNum - bNum;
+        });
+        stepEntries.forEach(([key, value]) => {
+          orderedSteps[key] = value;
+        });
+        orderedOutput.steps = orderedSteps;
+      } else {
+        orderedOutput.steps = updates.output_data.steps || {};
+      }
+      
+      processedUpdates.output_data = orderedOutput;
+    }
+
     const { error } = await this.supabase
       .from('workflow_execution_steps')
-      .update(updates)
+      .update(processedUpdates)
       .eq('execution_id', executionId)
       .eq('node_id', nodeId);
 
