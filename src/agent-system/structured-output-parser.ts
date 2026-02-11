@@ -8,7 +8,7 @@ export interface StructuredOutput {
   intent: string;
   action: string;
   missing_fields: string[];
-  steps: Step[];
+  steps: Record<string, Step>;
 }
 
 export interface Step {
@@ -80,11 +80,11 @@ export class StructuredOutputParser {
       intent: structuredOutput.intent || "unknown",
       action: structuredOutput.action || "answer_question",
       missing_fields: Array.isArray(structuredOutput.missing_fields) ? structuredOutput.missing_fields : [],
-      steps: Array.isArray(structuredOutput.steps) ? structuredOutput.steps : []
+      steps: (typeof structuredOutput.steps === 'object' && structuredOutput.steps !== null) ? structuredOutput.steps : {}
     };
 
     // Auto-fix if enabled
-    if (this.config.autoFix) {
+    if (this.config.autoFix && typeof result.steps === 'object') {
       result.steps = this.fixStepsStructure(result.steps);
     }
 
@@ -137,118 +137,111 @@ export class StructuredOutputParser {
   /**
    * Generate execution steps based on action type and extraction data
    */
-  private generateStepsFromAction(actionType: string, extraction: any): Step[] {
+  private generateStepsFromAction(actionType: string, extraction: any): Record<string, Step> {
     const normalized = this.normalizeExtraction(extraction);
-    const steps: Step[] = [];
+    const steps: any = {};
 
     switch (actionType) {
       case 'make_booking':
         // Step 1: Check availability
-        steps.push({
+        steps.get_availability = {
           number: 1,
           tool: 'get_availability',
           args: {
             date: normalized.date || '',
-            guest_count: normalized.guest_count || '',
-            guests: normalized.guest_count || '',
+            guests: normalized.guest_count || 2,
             requests: normalized.requests || []
           }
-        });
+        };
 
         // Step 2: Make booking (only if no missing fields)
         if (normalized.first_name && normalized.last_name && normalized.phone_number) {
-          steps.push({
+          steps.make_booking = {
             number: 2,
             tool: 'make_booking',
             args: {
-              first_name: normalized.first_name || '',
               firstName: normalized.first_name || '',
-              last_name: normalized.last_name || '',
               lastName: normalized.last_name || '',
-              phone_number: normalized.phone_number || '',
               phone: normalized.phone_number || '',
               email: normalized.email || '',
-              date: normalized.date || '',
-              guest_count: normalized.guest_count || '',
-              guests: normalized.guest_count || '',
               requests: normalized.requests || [],
-              comment: normalized.comment || '',
+              message: normalized.comment || '',
               waitlist: normalized.waitlist || false
             }
-          });
+          };
         }
+        return steps;
         break;
 
       case 'edit_booking':
-        steps.push({
+        steps.find_booking = {
           number: 1,
           tool: 'find_booking',
           args: {
             bookingref: normalized.bookingref || '',
             email: normalized.email || '',
-            phone_number: normalized.phone_number || '',
             phone: normalized.phone_number || '',
-            first_name: normalized.first_name || '',
-            last_name: normalized.last_name || ''
+            firstName: normalized.first_name || '',
+            lastName: normalized.last_name || ''
           }
-        });
+        };
 
-        steps.push({
+        steps.update_booking = {
           number: 2,
           tool: 'update_booking',
           args: {
             bookingref: normalized.bookingref || '',
             date: normalized.date || '',
-            guest_count: normalized.guest_count || '',
             guests: normalized.guest_count || '',
             requests: normalized.requests || [],
-            comment: normalized.comment || ''
+            message: normalized.comment || ''
           }
-        });
+        };
+        return steps;
         break;
 
       case 'cancel_booking':
-        steps.push({
+        steps.find_booking = {
           number: 1,
           tool: 'find_booking',
           args: {
             bookingref: normalized.bookingref || '',
             email: normalized.email || '',
-            phone_number: normalized.phone_number || '',
             phone: normalized.phone_number || '',
-            first_name: normalized.first_name || '',
-            last_name: normalized.last_name || ''
+            firstName: normalized.first_name || '',
+            lastName: normalized.last_name || ''
           }
-        });
+        };
 
-        steps.push({
+        steps.cancel_booking = {
           number: 2,
           tool: 'cancel_booking',
           args: {
             bookingref: normalized.bookingref || '',
             reason: normalized.comment || ''
           }
-        });
+        };
+        return steps;
         break;
 
       case 'find_booking':
-        steps.push({
+        steps.search_bookings = {
           number: 1,
           tool: 'search_bookings',
           args: {
             bookingref: normalized.bookingref || '',
             email: normalized.email || '',
-            phone_number: normalized.phone_number || '',
             phone: normalized.phone_number || '',
             date: normalized.date || '',
-            first_name: normalized.first_name || '',
-            last_name: normalized.last_name || ''
+            firstName: normalized.first_name || '',
+            lastName: normalized.last_name || ''
           }
-        });
+        };
+        return steps;
         break;
 
       case 'answer_question':
-        steps.push({
+        steps.generate_response = {
           number: 1,
           tool: 'generate_response',
           args: {
@@ -258,30 +251,35 @@ export class StructuredOutputParser {
               booking_policies: true
             }
           }
-        });
+        };
+        return steps;
         break;
 
       case 'request_info':
-        steps.push({
+        steps.request_additional_info = {
           number: 1,
           tool: 'request_additional_info',
           args: {
             missing_fields: this.identifyMissingFields(normalized, actionType),
             context: normalized.description || ''
           }
-        });
+        };
+        return steps;
         break;
 
       case 'escalate':
-        steps.push({
+        steps.escalate_to_human = {
           number: 1,
           tool: 'escalate_to_human',
           args: {
             reason: normalized.description || 'Manual review required',
             priority: 'medium'
           }
-        });
+        };
+        return steps;
         break;
+      default:
+        return {};
     }
 
     return steps;
@@ -290,12 +288,34 @@ export class StructuredOutputParser {
   /**
    * Fix and validate steps structure for auto-fix functionality
    */
-  private fixStepsStructure(steps: any[]): Step[] {
-    return steps.map((step, index) => ({
-      number: step.number || index + 1,
-      tool: step.tool || 'unknown_tool',
-      args: step.args || {}
-    }));
+  private fixStepsStructure(steps: any): Record<string, Step> {
+    if (Array.isArray(steps)) {
+      // Convert array to object
+      const stepsObj: Record<string, Step> = {};
+      steps.forEach((step, index) => {
+        const toolName = step.tool || `step_${index + 1}`;
+        stepsObj[toolName] = {
+          number: step.number || index + 1,
+          tool: step.tool || 'unknown_tool',
+          args: step.args || {}
+        };
+      });
+      return stepsObj;
+    } else if (typeof steps === 'object' && steps !== null) {
+      // Already an object, just validate
+      const result: Record<string, Step> = {};
+      for (const key in steps) {
+        if (steps.hasOwnProperty(key)) {
+          result[key] = {
+            number: steps[key].number || 1,
+            tool: steps[key].tool || key,
+            args: steps[key].args || {}
+          };
+        }
+      }
+      return result;
+    }
+    return {};
   }
 
   /**
@@ -332,32 +352,30 @@ export class StructuredOutputParser {
       "intent": "make_booking",
       "action": "make_booking", 
       "missing_fields": [],
-      "steps": [
-        {
+      "steps": {
+        "get_availability": {
           "number": 1,
           "tool": "get_availability",
           "args": {
             "date": "...",
-            "guest_count": "...",
+            "guests": "...",
             "requests": "..."
           }
         },
-        {
+        "make_booking": {
           "number": 2,
           "tool": "make_booking",
           "args": {
-            "first_name": "...",
-            "last_name": "...",
-            "phone_number": "...",
+            "firstName": "...",
+            "lastName": "...",
+            "phone": "...",
             "email": "...",
-            "date": "...",
-            "guest_count": "...",
             "requests": "...",
-            "comment": "...",
+            "message": "...",
             "waitlist": false
           }
         }
-      ]
+      }
     };
 
     return new StructuredOutputParser({
