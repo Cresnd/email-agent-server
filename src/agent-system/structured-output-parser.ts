@@ -62,11 +62,14 @@ export class StructuredOutputParser {
     const actionType = output.decision?.action_type || output.action_type || 'answer_question';
     const extraction = this.normalizeExtraction(output.refined_extraction || {});
 
+    const steps = this.generateStepsFromAction(actionType, extraction);
+    const orderedSteps = this.orderStepsByNumber(steps);
+
     const structuredOutput: StructuredOutput = {
       intent: extraction.intent || this.mapActionToIntent(actionType),
       action: actionType,
       missing_fields: this.identifyMissingFields(extraction, actionType),
-      steps: this.generateStepsFromAction(actionType, extraction)
+      steps: orderedSteps
     };
 
     return structuredOutput;
@@ -76,17 +79,22 @@ export class StructuredOutputParser {
    * Validate and optionally auto-fix the structured output
    */
   private validateAndFixStructure(structuredOutput: any): StructuredOutput {
+    let steps = (typeof structuredOutput.steps === 'object' && structuredOutput.steps !== null) ? structuredOutput.steps : {};
+    
+    // Auto-fix if enabled
+    if (this.config.autoFix && typeof steps === 'object') {
+      steps = this.fixStepsStructure(steps);
+    }
+
+    // Order steps by number
+    const orderedSteps = this.orderStepsByNumber(steps);
+
     const result: StructuredOutput = {
       intent: structuredOutput.intent || "unknown",
       action: structuredOutput.action || "answer_question",
       missing_fields: Array.isArray(structuredOutput.missing_fields) ? structuredOutput.missing_fields : [],
-      steps: (typeof structuredOutput.steps === 'object' && structuredOutput.steps !== null) ? structuredOutput.steps : {}
+      steps: orderedSteps
     };
-
-    // Auto-fix if enabled
-    if (this.config.autoFix && typeof result.steps === 'object') {
-      result.steps = this.fixStepsStructure(result.steps);
-    }
 
     return result;
   }
@@ -283,6 +291,28 @@ export class StructuredOutputParser {
     }
 
     return steps;
+  }
+
+  /**
+   * Order steps by their number property
+   */
+  private orderStepsByNumber(steps: Record<string, Step>): Record<string, Step> {
+    // Convert object to array with keys
+    const stepsArray = Object.entries(steps).map(([key, step]) => ({
+      key,
+      step
+    }));
+
+    // Sort by number
+    stepsArray.sort((a, b) => (a.step.number || 0) - (b.step.number || 0));
+
+    // Convert back to ordered object
+    const orderedSteps: Record<string, Step> = {};
+    stepsArray.forEach(({ key, step }) => {
+      orderedSteps[key] = step;
+    });
+
+    return orderedSteps;
   }
 
   /**
