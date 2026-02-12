@@ -94,9 +94,13 @@ export class BusinessLogicAgent {
       
       processingNotes.push(`Using orchestrator prompt (checksum: ${input.venue_prompts.orchestrator.checksum})`);
       
-      // Log inputs for debugging
-      console.log('[BusinessLogicAgent] Resolved prompt received:', input.resolved_prompt ? input.resolved_prompt.substring(0, 200) + '...' : 'none');
-      console.log('[BusinessLogicAgent] Parsing output:', JSON.stringify(input.parsing_output?.extraction_result, null, 2));
+      // AGGRESSIVE LOGGING - FIND THE BUG!
+      console.log('🔴🔴🔴 [BusinessLogicAgent] START AGGRESSIVE DEBUG 🔴🔴🔴');
+      console.log('[BusinessLogicAgent] Has resolved_prompt?', !!input.resolved_prompt);
+      console.log('[BusinessLogicAgent] Resolved prompt type:', typeof input.resolved_prompt);
+      console.log('[BusinessLogicAgent] Resolved prompt full:', input.resolved_prompt);
+      console.log('[BusinessLogicAgent] Parsing output exists?', !!input.parsing_output);
+      console.log('[BusinessLogicAgent] Parsing extraction_result:', JSON.stringify(input.parsing_output?.extraction_result, null, 2));
 
       // 2. Prepare AI input with parsing results and venue context
       // Use the resolved prompt if available (from workflow variables), otherwise prepare the default format
@@ -143,13 +147,19 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}`.trim();
       }
 
       // 3. Call AI with orchestrator prompt to make business decisions
+      console.log('🔵🔵🔵 [BusinessLogicAgent] SENDING TO AI:');
       console.log('[BusinessLogicAgent] Full AI Input:', aiInput);
+      console.log('[BusinessLogicAgent] System Prompt Length:', input.venue_prompts.orchestrator.prompt.length);
+      console.log('[BusinessLogicAgent] System Prompt Preview:', input.venue_prompts.orchestrator.prompt.substring(0, 500));
       
       const orchestratorResult = await this.callOrchestratorAI(
         input.venue_prompts.orchestrator.prompt,
         aiInput,
         input.output_parser
       );
+      
+      console.log('🟢🟢🟢 [BusinessLogicAgent] AI RESPONSE:');
+      console.log('[BusinessLogicAgent] Orchestrator Result:', JSON.stringify(orchestratorResult, null, 2));
       processingNotes.push(`Orchestrator decision: ${orchestratorResult.decision.action_type}`);
 
       // 4. Apply post-intent guardrails to the result
@@ -176,11 +186,23 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}`.trim();
         processing_notes: processingNotes
       };
 
-      // Apply structured output parsing
-      console.log('[BusinessLogicAgent] Passing to structured output parser:', JSON.stringify(baseResult, null, 2));
-      const structuredOutput = await this.structuredOutputParser.parse(baseResult);
-      console.log('[BusinessLogicAgent] Structured output result:', JSON.stringify(structuredOutput, null, 2));
-      processingNotes.push('Applied structured output parsing');
+      // SKIP structured output parsing - use raw AI output directly
+      console.log('⚠️⚠️⚠️ [BusinessLogicAgent] SKIPPING structured output parser - using raw AI output');
+      
+      // Use the raw AI output if it has the structured format
+      let structuredOutput = orchestratorResult._structured_output || orchestratorResult;
+      
+      // If the AI returned the correct format directly, use it
+      if (orchestratorResult.intent && orchestratorResult.action && orchestratorResult.steps) {
+        structuredOutput = {
+          intent: orchestratorResult.intent,
+          action: orchestratorResult.action,
+          missing_fields: orchestratorResult.missing_fields || [],
+          steps: orchestratorResult.steps
+        };
+      }
+      
+      console.log('✅✅✅ [BusinessLogicAgent] Using direct AI output as structured_output:', JSON.stringify(structuredOutput, null, 2));
 
       const result: BusinessLogicAgentOutput = {
         ...baseResult,
@@ -402,8 +424,13 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}`.trim();
       // Parse the JSON response
       let orchestratorResult;
       try {
+        console.log('🟡🟡🟡 [BusinessLogicAgent] RAW AI RESPONSE:', aiResponse);
         orchestratorResult = JSON.parse(aiResponse);
-        console.log('[BusinessLogicAgent] AI Output:', JSON.stringify(orchestratorResult, null, 2));
+        console.log('🟠🟠🟠 [BusinessLogicAgent] PARSED AI Output:', JSON.stringify(orchestratorResult, null, 2));
+        console.log('🔴 CRITICAL: AI returned missing_fields:', orchestratorResult.missing_fields);
+        console.log('🔴 CRITICAL: AI returned intent:', orchestratorResult.intent);
+        console.log('🔴 CRITICAL: AI returned action:', orchestratorResult.action);
+        console.log('🔴 CRITICAL: AI returned steps:', JSON.stringify(orchestratorResult.steps, null, 2));
       } catch (parseError) {
         throw new Error(`Failed to parse AI response as JSON: ${parseError}`);
       }
