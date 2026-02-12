@@ -36,10 +36,12 @@ export class StructuredOutputParser {
     try {
       // Check if the business logic output already contains structured output
       if (businessLogicOutput._structured_output) {
+        console.log('[StructuredOutputParser] Using _structured_output from AI');
         return this.validateAndFixStructure(businessLogicOutput._structured_output);
       }
 
       // If no structured output, create one from the legacy format
+      console.log('[StructuredOutputParser] No _structured_output found, converting legacy format');
       return this.convertLegacyOutput(businessLogicOutput);
 
     } catch (error) {

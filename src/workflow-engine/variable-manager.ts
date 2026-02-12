@@ -178,35 +178,37 @@ export class VariableManager {
     // Handle ${variable} and {{variable}} syntax
     return str.replace(/\$\{([^}]+)\}|\{\{([^}]+)\}\}/g, (match, dollarVar, braceVar) => {
       const variableName = (dollarVar || braceVar).trim();
+      
+      // Validate that variable follows node_name.parameter format
+      // Unless it's a system variable (starting with __ or is a known top-level variable)
+      const parts = variableName.split('.');
+      const isSystemVariable = variableName.startsWith('__') || 
+                              ['venue_id', 'venue_name', 'customer_email', 'conversation_id', 
+                               'session_id', 'organization_id', 'phone_number', 'first_name',
+                               'last_name', 'subject', 'message', 'email_server', 'received_at',
+                               'venue_address', 'venue_description', 'venue_timezone',
+                               'company_email', 'finance_email', 'comment', 'requests',
+                               'waitlist', 'messaging_service_id'].includes(variableName) ||
+                              // Allow any variable that exists in the context (including node outputs)
+                              variables[variableName] !== undefined;
+      
+      // Removed verbose warning logs
+      
       const value = this.resolveVariablePath(variables, variableName);
       
-      console.log(`[VariableManager] Resolving variable: ${variableName}`);
-      
-      if (variableName === 'step.parsing_agent') {
-        console.log(`[VariableManager] *** STEP.PARSING_AGENT FOUND ***`);
-        console.log(`[VariableManager] Type:`, typeof value);
-        console.log(`[VariableManager] Is object:`, typeof value === 'object' && value !== null);
-        console.log(`[VariableManager] Keys:`, typeof value === 'object' && value !== null ? Object.keys(value) : 'N/A');
-        console.log(`[VariableManager] Value preview:`, JSON.stringify(value)?.substring(0, 500) + '...');
-      } else {
-        console.log(`[VariableManager] Variable value:`, JSON.stringify(value, null, 2));
-        console.log(`[VariableManager] Available variables:`, Object.keys(variables));
-      }
-      
       if (value === undefined || value === null) {
-        console.log(`[VariableManager] Variable '${variableName}' not found, keeping original: ${match}`);
+        // Only log when variable is not found and it's not a system variable
+        if (!variableName.startsWith('__') && !variableName.includes('_guardrail.')) {
+          console.log(`[VariableManager] ⚠️ Variable '${variableName}' not found`);
+        }
         return match; // Keep original if variable not found
       }
 
       if (typeof value === 'object') {
-        const result = JSON.stringify(value);
-        console.log(`[VariableManager] Serialized object to JSON:`, result.substring(0, 200) + '...');
-        return result;
+        return JSON.stringify(value);
       }
       
-      const result = String(value);
-      console.log(`[VariableManager] Resolved to string:`, result.substring(0, 200) + '...');
-      return result;
+      return String(value);
     });
   }
 

@@ -247,6 +247,8 @@ export class AgentManager {
       const registerStepOutput = (stepName: string, outputData: Record<string, any>) => {
         const key = toSnakeCase(stepName);
         executionVariables.step[key] = outputData;
+        // Also register as top-level variable for direct access via {{stepName}}
+        executionVariables[key] = outputData;
       };
 
       // Walk the workflow graph following connections based on node output
@@ -605,11 +607,36 @@ export class AgentManager {
           const nameLower = (step.name || '').toLowerCase();
 
           let resolvedAgentPrompt: string | undefined;
+          let resolvedInputVariables: Record<string, any> = {};
           if (step.prompt && Object.keys(executionVariables).length > 0) {
-            resolvedAgentPrompt = this.variableManager.resolveVariables(
+            // Resolve the prompt and capture which variables were used
+            const resolvedData = this.variableManager.resolveVariables(
               { prompt: step.prompt },
               executionVariables
-            ).prompt as string;
+            );
+            resolvedAgentPrompt = resolvedData.prompt as string;
+            
+            // Extract all variables that were referenced in the prompt
+            const variablePattern = /\{\{\s*([^}]+)\s*\}\}/g;
+            let match;
+            const extractedVarNames = new Set<string>();
+            
+            while ((match = variablePattern.exec(step.prompt)) !== null) {
+              const varPath = match[1].trim();
+              extractedVarNames.add(varPath);
+            }
+            
+            // Resolve each variable
+            for (const varPath of extractedVarNames) {
+              const resolved = this.variableManager.resolveVariables(
+                { [varPath]: `{{${varPath}}}` },
+                executionVariables
+              );
+              if (resolved[varPath] !== `{{${varPath}}}`) {
+                // Variable was resolved successfully
+                resolvedInputVariables[varPath] = resolved[varPath];
+              }
+            }
           }
 
           if (nameLower.includes('parsing')) {
@@ -628,21 +655,57 @@ export class AgentManager {
               }
             }
             
+            const resolvedSystemPrompt = this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts);
             const parsingInput: ParsingAgentInput = {
               email_content: context.email_content,
-              venue_prompts: { email_extractor: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.parser || context.venue_prompts.email_extractor },
+              venue_prompts: { email_extractor: resolvedSystemPrompt || context.venue_prompts.parser || context.venue_prompts.email_extractor },
               guardrails: { intent_guardrails: context.guardrails.pre_intent_guardrails }
             };
+            
+            // Log node input
+            this.logger.info('📥 NODE INPUT [parsing]', {
+              email_subject: context.email_content.subject,
+              email_message: context.email_content.message_for_ai || context.email_content.message,
+              prompt_length: parsingInput.venue_prompts.email_extractor?.length || 0,
+              guardrails_count: parsingInput.guardrails.intent_guardrails?.length || 0,
+              resolved_variables: Object.keys(resolvedInputVariables)
+            });
+            
+            // Log what will be stored as input_data
+            this.logger.info('💾 INPUT DATA STORAGE [parsing]', {
+              input_variables: resolvedInputVariables,
+              system_prompt: resolvedSystemPrompt ? 'Resolved from workflow' : 'Using fallback',
+              system_prompt_type: step.system_prompt_type || 'not set'
+            });
             parsingOutput = await this.executeWithLogging('parsing', agentRunId, () => this.parsingAgent.process(parsingInput));
             parsingTime = Date.now() - parsingStartTime;
             processingNotes.push(`Parsing Agent completed in ${parsingTime}ms - Intent: ${parsingOutput.extraction_result.intent}`);
-            this.logger.info('Parsing Agent completed', { agent_run_id: agentRunId, intent_type: parsingOutput.extraction_result.intent, processing_time_ms: parsingTime });
-            const parsingStepOutput = {
+            
+            // Log parsing agent output
+            this.logger.info('📊 NODE OUTPUT [parsing]', {
+              output: JSON.stringify(parsingOutput, null, 2),
               intent: parsingOutput.extraction_result?.intent,
               action: parsingOutput.extraction_result?.action,
-              extracted_data: parsingOutput.extraction_result,
-              guardrail_status: parsingOutput.guardrail_status
-            };
+              extraction_keys: Object.keys(parsingOutput.extraction_result || {}),
+              time_ms: parsingTime
+            });
+            
+            // Debug logging to understand the structure
+            this.logger.info('🔍 PARSING OUTPUT STRUCTURE', {
+              has_extraction_result: !!parsingOutput.extraction_result,
+              extraction_result_type: typeof parsingOutput.extraction_result,
+              extraction_result_keys: parsingOutput.extraction_result ? Object.keys(parsingOutput.extraction_result) : 'N/A',
+              raw_extraction_result: JSON.stringify(parsingOutput.extraction_result, null, 2)
+            });
+            
+            // Store the full extraction result directly for easier access
+            const parsingStepOutput = parsingOutput.extraction_result || {};
+            
+            // Log what will be stored and available to next nodes
+            this.logger.info('💾 NODE STORAGE [parsing]', {
+              stored_output: JSON.stringify(parsingStepOutput, null, 2)
+            });
+            
             registerStepOutput(step.name, parsingStepOutput);
 
             if (step.agent_type === 'parsing') {
@@ -671,13 +734,9 @@ export class AgentManager {
                 await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
                   status: 'completed',
                   input_data: {
-                    subject: context.email_content.subject,
-                    message: context.email_content.message,
-                    message_for_ai: context.email_content.message_for_ai,
-                    customer_email: context.email_content.customer_email,
-                    first_name: context.email_content.first_name,
-                    last_name: context.email_content.last_name,
-                    parser_prompt: parsingInput.venue_prompts.parser || parsingInput.venue_prompts.email_extractor
+                    ...resolvedInputVariables,
+                    system_prompt: resolvedSystemPrompt || parsingInput.venue_prompts.email_extractor,
+                    system_prompt_type: step.system_prompt_type
                   },
                   output_data: parsingStepOutput,
                   started_at: new Date(Date.now() - parsingTime).toISOString(),
@@ -706,20 +765,43 @@ export class AgentManager {
               }
             }
             
+            const resolvedBusinessLogicSystemPrompt = this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts);
             const businessLogicInput: BusinessLogicAgentInput = {
               parsing_output: parsingOutput,
               venue_settings: context.venue_settings,
-              venue_prompts: { orchestrator: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || context.venue_prompts.business_logic || context.venue_prompts.orchestrator },
+              venue_prompts: { orchestrator: resolvedBusinessLogicSystemPrompt || context.venue_prompts.business_logic || context.venue_prompts.orchestrator },
               guardrails: { post_intent_guardrails: context.guardrails.post_intent_guardrails },
               current_bookings: [],
               availability_data: null,
               output_parser: step.output_parser || undefined,
-              resolved_prompt: resolvedAgentPrompt // Pass the resolved prompt from workflow variables
+              resolved_prompt: resolvedAgentPrompt // Pass the resolved prompt with variable substitution
             };
+            
+            // Log node input
+            this.logger.info('📥 NODE INPUT [business_logic]', {
+              parsing_intent: parsingOutput?.extraction_result?.intent,
+              parsing_action: parsingOutput?.extraction_result?.action,
+              resolved_prompt_preview: resolvedAgentPrompt?.substring(0, 100),
+              guardrails_count: businessLogicInput.guardrails.post_intent_guardrails?.length || 0,
+              resolved_variables: Object.keys(resolvedInputVariables)
+            });
+            
+            // Log what will be stored as input_data
+            this.logger.info('💾 INPUT DATA STORAGE [business_logic]', {
+              input_variables: resolvedInputVariables,
+              resolved_prompt: resolvedAgentPrompt,
+              system_prompt: resolvedBusinessLogicSystemPrompt ? 'Resolved from workflow' : 'Using fallback',
+              system_prompt_type: step.system_prompt_type || 'not set'
+            });
             businessLogicOutput = await this.executeWithLogging('business_logic', agentRunId, () => this.businessLogicAgent.process(businessLogicInput));
             businessLogicTime = Date.now() - businessLogicStartTime;
+            // Log business logic output
+            this.logger.info('📊 NODE OUTPUT [business_logic]', {
+              decision: businessLogicOutput.decision,
+              structured_output: businessLogicOutput.structured_output,
+              time_ms: businessLogicTime
+            });
             processingNotes.push(`Business Logic Agent completed in ${businessLogicTime}ms - Decision: ${businessLogicOutput.decision.action_type}`);
-            this.logger.info('Business Logic Agent completed', { agent_run_id: agentRunId, action_type: businessLogicOutput.decision.action_type, processing_time_ms: businessLogicTime });
             
             // Use the new structured output format as the main output for business logic agents
             let businessLogicStepOutput: Record<string, any>;
@@ -728,7 +810,7 @@ export class AgentManager {
               const structured = businessLogicOutput.structured_output;
               
               // First order the steps by number
-              const orderedSteps: Record<string, any> = {};
+              const orderedBusinessLogicSteps: Record<string, any> = {};
               if (structured.steps && typeof structured.steps === 'object') {
                 const stepEntries = Object.entries(structured.steps as Record<string, any>);
                 stepEntries.sort((a: any, b: any) => {
@@ -737,7 +819,7 @@ export class AgentManager {
                   return aNum - bNum;
                 });
                 stepEntries.forEach(([key, value]) => {
-                  orderedSteps[key] = value;
+                  orderedBusinessLogicSteps[key] = value;
                 });
               }
               
@@ -746,7 +828,7 @@ export class AgentManager {
               businessLogicStepOutput.intent = structured.intent;
               businessLogicStepOutput.action = structured.action;
               businessLogicStepOutput.missing_fields = structured.missing_fields;
-              businessLogicStepOutput.steps = orderedSteps;
+              businessLogicStepOutput.steps = orderedBusinessLogicSteps;
               
               processingNotes.push(`Using structured output format - Intent: ${structured.intent}, Action: ${structured.action}`);
             } else {
@@ -760,16 +842,20 @@ export class AgentManager {
                 guardrail_status: businessLogicOutput.guardrail_status
               };
             }
+            // Log what will be stored
+            this.logger.info('💾 NODE STORAGE [business_logic]', {
+              stored_output: JSON.stringify(businessLogicStepOutput, null, 2)
+            });
             registerStepOutput(step.name, businessLogicStepOutput);
             if (workflowExecutionId) {
               try {
                 await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
                   status: 'completed',
                   input_data: {
-                    intent: parsingOutput.extraction_result?.intent,
-                    action: parsingOutput.extraction_result?.action,
-                    venue_name: context.venue_settings.venue_name,
-                    business_logic_prompt: businessLogicInput.venue_prompts.business_logic
+                    ...resolvedInputVariables,
+                    resolved_prompt: resolvedAgentPrompt,
+                    system_prompt: resolvedBusinessLogicSystemPrompt || businessLogicInput.venue_prompts.orchestrator,
+                    system_prompt_type: step.system_prompt_type
                   },
                   output_data: businessLogicStepOutput,
                   started_at: new Date(Date.now() - businessLogicTime).toISOString(),
@@ -798,13 +884,14 @@ export class AgentManager {
               }
             }
             
+            const resolvedActionSystemPrompt = this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts);
             const actionExecutionInput: ActionExecutionAgentInput = {
               business_logic_output: businessLogicOutput,
               original_email: context.email_content,
               customer_data: { first_name: parsingOutput.extraction_result.first_name, last_name: parsingOutput.extraction_result.last_name },
               workflowExecutionId: workflowExecutionId,
               venue_settings: context.venue_settings,
-              venue_prompts: { execution_prompt: this.resolveSystemPromptData(step.system_prompt_type, context.venue_prompts) || this.getExecutionPrompt(businessLogicOutput.decision.action_type, context.venue_prompts) },
+              venue_prompts: { execution_prompt: resolvedActionSystemPrompt || this.getExecutionPrompt(businessLogicOutput.decision.action_type, context.venue_prompts) },
               guardrails: { final_check_guardrails: context.guardrails.final_check_guardrails },
               email_infrastructure: context.email_infrastructure
             };
@@ -828,15 +915,9 @@ export class AgentManager {
                 await this.db.updateWorkflowExecutionStep(workflowExecutionId, step.id, {
                   status: 'completed',
                   input_data: {
-                    action_type: businessLogicOutput.decision.action_type,
-                    reasoning: businessLogicOutput.decision.reasoning,
-                    refined_extraction: businessLogicOutput.refined_extraction,
-                    original_subject: context.email_content.subject,
-                    customer_email: context.email_content.customer_email,
-                    message_for_ai: context.email_content.message_for_ai,
-                    venue_name: context.venue_settings.venue_name,
-                    venue_id: context.venue_settings.venue_id,
-                    execution_prompt: actionExecutionInput.venue_prompts.execution_prompt
+                    ...resolvedInputVariables,
+                    system_prompt: resolvedActionSystemPrompt || actionExecutionInput.venue_prompts.execution_prompt,
+                    system_prompt_type: step.system_prompt_type
                   },
                   output_data: actionStepOutput,
                   started_at: new Date(Date.now() - actionExecutionTime).toISOString(),

@@ -256,12 +256,13 @@ export class WorkflowExecutor {
   ): Promise<void> {
     // This will be connected to WebSocket broadcasting
     // For now, log the event
-    console.log(`[${new Date().toISOString()}] ${eventType}:`, {
-      workflowId: context.workflowId,
-      executionId: context.executionId,
-      currentStep: context.currentStep,
-      status: context.status
-    });
+    // Disabled: Excessive logging
+    // console.log(`[${new Date().toISOString()}] ${eventType}:`, {
+    //   workflowId: context.workflowId,
+    //   executionId: context.executionId,
+    //   currentStep: context.currentStep,
+    //   status: context.status
+    // });
 
     // TODO: Implement real-time event broadcasting
     // await this.eventPublisher.publish(eventType, context);
@@ -272,7 +273,7 @@ export class WorkflowExecutor {
    */
   async cancelExecution(executionId: string): Promise<void> {
     // TODO: Implement execution cancellation
-    console.log(`Cancelling execution: ${executionId}`);
+    // Disabled: console.log(`Cancelling execution: ${executionId}`);
   }
 
   /**

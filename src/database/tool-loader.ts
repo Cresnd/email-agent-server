@@ -419,21 +419,20 @@ export class ToolLoader {
         return {};
       }
 
-      // Build context with step. prefix for each step's output
+      // Build context with node names as top-level keys
       const stepContext: Record<string, any> = {};
       
       for (const step of steps) {
         if (step.output_data && step.step_name) {
           // Create a clean step name (remove spaces, make lowercase)
           const cleanStepName = step.step_name.toLowerCase().replace(/\s+/g, '_');
-          stepContext[`step.${cleanStepName}`] = step.output_data;
           
-          // Also add without 'step.' prefix for backwards compatibility
+          // Add node output directly with its clean name
           stepContext[cleanStepName] = step.output_data;
           
-          this.logger.debug('Added step to context', {
+          this.logger.debug('Added node to context', {
             original_name: step.step_name,
-            clean_name: cleanStepName,
+            node_name: cleanStepName,
             status: step.status,
             has_output: !!step.output_data,
             output_keys: step.output_data ? Object.keys(step.output_data).slice(0, 5) : []
@@ -441,10 +440,10 @@ export class ToolLoader {
         }
       }
 
-      this.logger.info('Built step context for tool execution', {
+      this.logger.info('Built node context for tool execution', {
         workflow_execution_id: workflowExecutionId,
-        step_count: steps.length,
-        step_names: Object.keys(stepContext).filter(k => k.startsWith('step.')),
+        node_count: steps.length,
+        node_names: Object.keys(stepContext),
         context_keys: Object.keys(stepContext).slice(0, 10)
       });
 
@@ -474,54 +473,31 @@ export class ToolLoader {
       // Check if this variable is wrapped in quotes
       const isQuoted = openQuote === '"' && closeQuote === '"';
       
-      // Special handling for step.* variables
-      if (keys[0] === 'step' && keys.length > 1) {
-        // Check if we have a flattened key like 'step.business_logic'
-        const stepKey = `step.${keys[1]}`;
-        if (stepKey in vars) {
-          // We found the step context, now navigate the remaining path
-          value = vars[stepKey];
-          const remainingKeys = keys.slice(2);
-          
-          for (const key of remainingKeys) {
-            if (value && typeof value === 'object' && key in value) {
-              value = value[key];
-            } else {
-              this.logger.debug(`Variable not found in step context: ${trimmedPath}`, { 
-                step_key: stepKey,
-                remaining_path: remainingKeys.join('.'),
-                available_in_step: value ? Object.keys(value).slice(0, 10) : [],
-                full_path: trimmedPath
-              });
-              return isQuoted ? '""' : '';
-            }
-          }
+      // Navigate the path starting from the node name
+      // The first part should always be a node name or a system variable
+      for (const key of keys) {
+        if (value && typeof value === 'object' && key in value) {
+          value = value[key];
         } else {
-          // Try normal navigation
-          for (const key of keys) {
-            if (value && typeof value === 'object' && key in value) {
-              value = value[key];
-            } else {
-              this.logger.debug(`Variable not found: ${trimmedPath}`, { 
-                failed_at_key: key,
-                available_keys: Object.keys(vars).filter(k => k.startsWith('step')).slice(0, 10) 
-              });
-              return isQuoted ? '""' : '';
-            }
-          }
-        }
-      } else {
-        // Normal path navigation for non-step variables
-        for (const key of keys) {
-          if (value && typeof value === 'object' && key in value) {
-            value = value[key];
-          } else {
-            this.logger.debug(`Variable not found: ${trimmedPath}`, { 
-              failed_at_key: key,
-              available_keys: Object.keys(vars).slice(0, 20) 
+          // Log detailed debug info about what's available
+          if (keys.indexOf(key) === 0) {
+            // First key should be a node name
+            this.logger.debug(`Node '${key}' not found in context`, { 
+              requested_node: key,
+              available_nodes: Object.keys(vars).slice(0, 20),
+              full_path: trimmedPath
             });
-            return isQuoted ? '""' : '';
+          } else {
+            // Subsequent keys are parameters within the node
+            this.logger.debug(`Parameter not found in node context: ${trimmedPath}`, { 
+              failed_at_key: key,
+              node_name: keys[0],
+              remaining_path: keys.slice(keys.indexOf(key)).join('.'),
+              available_in_node: value && typeof value === 'object' ? Object.keys(value).slice(0, 10) : [],
+              full_path: trimmedPath
+            });
           }
+          return isQuoted ? '""' : '';
         }
       }
       

@@ -872,7 +872,8 @@ export class DatabaseQueries {
 
     // Special handling for output_data to preserve field order
     const processedUpdates = { ...updates };
-    if (updates.output_data && updates.output_data.intent !== undefined) {
+    // Only reorder if this is specifically a business logic output (has steps field)
+    if (updates.output_data && updates.output_data.steps !== undefined) {
       // This is a business logic output - ensure field order
       const orderedOutput: any = {};
       
@@ -882,7 +883,7 @@ export class DatabaseQueries {
       orderedOutput.missing_fields = updates.output_data.missing_fields;
       
       // Order steps by number
-      if (updates.output_data.steps) {
+      if (updates.output_data.steps && typeof updates.output_data.steps === 'object') {
         const orderedSteps: any = {};
         const stepEntries = Object.entries(updates.output_data.steps);
         stepEntries.sort((a: any, b: any) => {

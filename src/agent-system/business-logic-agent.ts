@@ -93,25 +93,58 @@ export class BusinessLogicAgent {
       }
       
       processingNotes.push(`Using orchestrator prompt (checksum: ${input.venue_prompts.orchestrator.checksum})`);
+      
+      // Log inputs for debugging
+      console.log('[BusinessLogicAgent] Resolved prompt received:', input.resolved_prompt ? input.resolved_prompt.substring(0, 200) + '...' : 'none');
+      console.log('[BusinessLogicAgent] Parsing output:', JSON.stringify(input.parsing_output?.extraction_result, null, 2));
 
       // 2. Prepare AI input with parsing results and venue context
       // Use the resolved prompt if available (from workflow variables), otherwise prepare the default format
       let aiInput: string;
       if (input.resolved_prompt) {
-        aiInput = input.resolved_prompt;
-        processingNotes.push(`Using resolved prompt from workflow variables`);
-
-        const directResult = await this.tryProcessStructuredPrompt(aiInput, input.parsing_output, processingNotes);
-        if (directResult) {
-          processingNotes.push('Structured JSON detected in business_logic prompt - skipping orchestrator call');
-          return directResult;
+        // The resolved prompt should contain the parsing output
+        // Parse it if it's a JSON string
+        let parsedData;
+        try {
+          parsedData = typeof input.resolved_prompt === 'string' ? JSON.parse(input.resolved_prompt) : input.resolved_prompt;
+          console.log('[BusinessLogicAgent] Parsed resolved prompt data:', JSON.stringify(parsedData, null, 2));
+        } catch (e) {
+          console.log('[BusinessLogicAgent] Could not parse resolved prompt as JSON, using as-is');
+          parsedData = input.resolved_prompt;
         }
+        
+        // Format as extracted_data for the AI prompt which expects extracted_data.field references
+        // The prompt expects to be able to reference extracted_data.date, extracted_data.first_name, etc.
+        aiInput = `The parsing agent has provided the following extracted_data:
+
+extracted_data = ${JSON.stringify(parsedData, null, 2)}
+
+This data is available as extracted_data, where each field can be referenced as extracted_data.fieldname.
+
+The following fields are available:
+- extracted_data.intent = "${parsedData.intent || ''}"
+- extracted_data.action = "${parsedData.action || ''}"
+- extracted_data.date = "${parsedData.date || ''}"
+- extracted_data.first_name = "${parsedData.first_name || ''}"
+- extracted_data.last_name = "${parsedData.last_name || ''}"
+- extracted_data.phone_number = "${parsedData.phone_number || ''}"
+- extracted_data.email = "${parsedData.email || ''}"
+- extracted_data.guest_count = ${parsedData.guest_count || 'null'}
+- extracted_data.requests = ${JSON.stringify(parsedData.requests || [])}
+
+Please analyze this extracted_data and create the appropriate business logic plan according to the rules in your prompt.
+
+CURRENT BOOKINGS: ${JSON.stringify(input.current_bookings || [])}
+AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}`.trim();
+        processingNotes.push(`Using resolved prompt from workflow variables`);
       } else {
         aiInput = this.prepareOrchestratorInput(input);
         processingNotes.push(`Prepared orchestrator input for action: ${input.parsing_output.extraction_result.action}`);
       }
 
       // 3. Call AI with orchestrator prompt to make business decisions
+      console.log('[BusinessLogicAgent] Full AI Input:', aiInput);
+      
       const orchestratorResult = await this.callOrchestratorAI(
         input.venue_prompts.orchestrator.prompt,
         aiInput,
@@ -144,7 +177,9 @@ export class BusinessLogicAgent {
       };
 
       // Apply structured output parsing
+      console.log('[BusinessLogicAgent] Passing to structured output parser:', JSON.stringify(baseResult, null, 2));
       const structuredOutput = await this.structuredOutputParser.parse(baseResult);
+      console.log('[BusinessLogicAgent] Structured output result:', JSON.stringify(structuredOutput, null, 2));
       processingNotes.push('Applied structured output parsing');
 
       const result: BusinessLogicAgentOutput = {
@@ -168,32 +203,39 @@ export class BusinessLogicAgent {
    */
   private prepareOrchestratorInput(input: BusinessLogicAgentInput): string {
     const parsingResult = input.parsing_output.extraction_result;
-    const venueInfo = input.venue_settings;
     
-    return `
-VENUE CONTEXT:
-- Venue: ${venueInfo.venue_name}
-- Venue ID: ${venueInfo.venue_id}
-- Address: ${venueInfo.venue_address}
-- Timezone: ${venueInfo.venue_timezone}
-- Organization: ${venueInfo.organization_name}
+    // Format as extracted_data JSON as expected by the prompt
+    const extractedData = {
+      intent: parsingResult.intent,
+      action: parsingResult.action,
+      first_name: parsingResult.first_name,
+      last_name: parsingResult.last_name,
+      email: parsingResult.email,
+      phone_number: parsingResult.phone_number,
+      guest_count: parsingResult.guest_count,
+      date: parsingResult.date,
+      requests: parsingResult.requests,
+      comment: parsingResult.comment,
+      description: parsingResult.description,
+      message_for_ai: parsingResult.message_for_ai,
+      waitlist: parsingResult.waitlist,
+      keep_original_time: parsingResult.keep_original_time,
+      bookingref: parsingResult.bookingref,
+      search_time: parsingResult.search_time,
+      new_time: parsingResult.new_time,
+      language: parsingResult.language
+    };
+    
+    return `The parsing agent has provided the following extracted_data:
 
-PARSED EMAIL EXTRACTION:
-- Intent: ${parsingResult.intent}
-- Action: ${parsingResult.action}
-- Customer: ${parsingResult.first_name} ${parsingResult.last_name}
-- Email: ${parsingResult.email}
-- Phone: ${parsingResult.phone_number}
-- Guest Count: ${parsingResult.guest_count}
-- Date: ${parsingResult.date}
-- Time: ${parsingResult.requests.map(r => `${r.type} at ${r.time}`).join(', ')}
-- Comment: ${parsingResult.comment}
-- Description: ${parsingResult.description}
-- Message: ${parsingResult.message_for_ai}
+extracted_data = ${JSON.stringify(extractedData, null, 2)}
+
+This data is available as extracted_data, where each field can be referenced as extracted_data.fieldname.
+
+Please analyze this extracted_data and create the appropriate business logic plan according to the rules in your prompt.
 
 CURRENT BOOKINGS: ${JSON.stringify(input.current_bookings || [])}
-AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
-    `.trim();
+AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}`.trim();
   }
 
   /**
@@ -329,7 +371,7 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
           'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: 'gpt-4o',
           messages: [
             {
               role: 'system',
@@ -361,6 +403,7 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
       let orchestratorResult;
       try {
         orchestratorResult = JSON.parse(aiResponse);
+        console.log('[BusinessLogicAgent] AI Output:', JSON.stringify(orchestratorResult, null, 2));
       } catch (parseError) {
         throw new Error(`Failed to parse AI response as JSON: ${parseError}`);
       }
@@ -377,30 +420,32 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
           intent: orchestratorResult.intent,
           action: orchestratorResult.action,
           missing_fields: orchestratorResult.missing_fields || [],
-          steps: orchestratorResult.steps || []
+          steps: orchestratorResult.steps || {}
         };
       }
 
-      const refined_extraction = {
-        first_name: orchestratorResult.refined_extraction?.first_name || '',
-        last_name: orchestratorResult.refined_extraction?.last_name || '',
-        guest_count: orchestratorResult.refined_extraction?.guest_count || null,
-        comment: orchestratorResult.refined_extraction?.comment || '',
-        date: orchestratorResult.refined_extraction?.date || '',
-        phone_number: orchestratorResult.refined_extraction?.phone_number || '',
-        requests: Array.isArray(orchestratorResult.refined_extraction?.requests) ? orchestratorResult.refined_extraction.requests : [],
-        search_time: orchestratorResult.refined_extraction?.search_time || '',
-        new_time: orchestratorResult.refined_extraction?.new_time || '',
-        intent: orchestratorResult.refined_extraction?.intent || 'general_question',
-        action: orchestratorResult.refined_extraction?.action || decision.action_type,
-        request_details: orchestratorResult.refined_extraction?.request_details || {},
-        description: orchestratorResult.refined_extraction?.description || 'Orchestrator processing complete',
-        message_for_ai: orchestratorResult.refined_extraction?.message_for_ai || '',
-        email: orchestratorResult.refined_extraction?.email || '',
-        waitlist: orchestratorResult.refined_extraction?.waitlist || false,
-        keep_original_time: orchestratorResult.refined_extraction?.keep_original_time !== undefined ? orchestratorResult.refined_extraction.keep_original_time : true,
-        bookingref: orchestratorResult.refined_extraction?.bookingref || '',
-        language: orchestratorResult.refined_extraction?.language || 'en'
+      // Use the original parsing extraction result if no refined_extraction from AI
+      const parsingExtraction = this.extractDataFromInput(orchestratorInput);
+      const refined_extraction = orchestratorResult.refined_extraction || parsingExtraction || {
+        first_name: '',
+        last_name: '',
+        guest_count: null,
+        comment: '',
+        date: '',
+        phone_number: '',
+        requests: [],
+        search_time: '',
+        new_time: '',
+        intent: orchestratorResult.intent || 'general_question',
+        action: orchestratorResult.action || decision.action_type,
+        request_details: {},
+        description: 'Orchestrator processing complete',
+        message_for_ai: '',
+        email: '',
+        waitlist: false,
+        keep_original_time: true,
+        bookingref: '',
+        language: 'en'
       };
 
       const returnValue: any = {
@@ -571,5 +616,18 @@ AVAILABILITY DATA: ${JSON.stringify(input.availability_data || {})}
     };
 
     return intentMap[actionType] || 'general_question';
+  }
+
+  private extractDataFromInput(orchestratorInput: string): any {
+    try {
+      // Extract the JSON from the orchestrator input
+      const match = orchestratorInput.match(/\{[\s\S]*\}/);
+      if (match) {
+        return JSON.parse(match[0]);
+      }
+    } catch (error) {
+      console.error('Failed to extract data from orchestrator input:', error);
+    }
+    return null;
   }
 }
